@@ -1,0 +1,6 @@
+{
+  "name": "AMBIKA ASSOCIATE CRM",
+  "description": "AMBIKA ASSOCIATE – Smart Finance Smart Saving. Financial Services CRM with Lead-to-Disbursement tracking, Role-Based Access Control, Duplicate Detection, SLA Penalties, GPS Field Operations, Petrol Incentives, and Management Reporting.",
+  "requestFramePermissions": ["geolocation", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
