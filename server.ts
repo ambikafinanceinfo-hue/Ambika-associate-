@@ -44,6 +44,26 @@ async function startServer() {
     res.send(renderAccountDeletionHtml());
   });
 
+  // Google Play Android App Links / Digital Asset Links verification
+  app.get('/.well-known/assetlinks.json', (_req, res) => {
+    const fingerprints = String(process.env.ANDROID_SHA256_CERT_FINGERPRINTS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+    res.json([
+      {
+        relation: ['delegate_permission/common.handle_all_urls'],
+        target: {
+          namespace: 'android_app',
+          package_name: 'in.ambikaassociate.crm',
+          sha256_cert_fingerprints: fingerprints,
+        },
+      },
+    ]);
+  });
+
   // Prevent stale caching of PWA shell, Service Worker, Manifest, APIs & Official Logo icons
   app.use((req, res, next) => {
     const p = req.path;

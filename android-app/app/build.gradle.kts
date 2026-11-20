@@ -28,8 +28,8 @@ android {
         applicationId = "in.ambikaassociate.crm"
         minSdk = 24
         targetSdk = 35
-        versionCode = 10002
-        versionName = "2.1.0"
+        versionCode = 10003
+        versionName = "2.2.0"
 
         // Automatically patched to your live HTTPS server URL by /api/public/android-app-kit
         buildConfigField(

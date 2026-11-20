@@ -203,7 +203,7 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        if (prefs.getBoolean("terms_disclosure_accepted_v1", false)) {
+        if (prefs.getBoolean("terms_disclosure_accepted_v2", false)) {
             webView.loadUrl(baseUrl)
         } else {
             showFirstLaunchDisclosureDialog()
@@ -217,13 +217,16 @@ class MainActivity : AppCompatActivity() {
     private fun showFirstLaunchDisclosureDialog() {
         val message = """
             Welcome to AMBIKA ASSOCIATE — Smart Finance Smart Saving CRM.
+            Head Office: 1st Floor, Anupam Complex, Pateri Road, Near Reliance Bazar, Satna, MP (485001).
 
-            Before you continue, please review and accept our Terms & Conditions and Privacy Policy:
+            Authorized Staff & Partner Operations Portal (Not a direct consumer lending app; loans are processed exclusively by RBI-regulated partner Banks/NBFCs).
 
-            1. Location Data (Foreground Only): When Field Officers activate Bike Run or Field Visit check-in, GPS location is recorded to verify visit distance and calculate petrol conveyance.
+            Before continuing, please review our Terms & Conditions and Privacy Policy:
+
+            1. Location Data (Foreground Only): Used only while the app is open for Daily Office GPS Attendance (within Satna Office zone) and Field Officer Visit / Bike Run mileage verification. No background location tracking.
             2. Camera & Storage: Used only when you capture PAN/Aadhaar KYC documents or visit selfies.
-            3. Microphone: Used only when you tap Record Audio for follow-up call notes (auto-deleted after 7 days).
-            4. Data Deletion: You may request account or data deletion anytime via Settings or $baseUrl/account-deletion.
+            3. Microphone: Used only when you tap Record Audio for consented follow-up call notes (auto-deleted after 7 days).
+            4. Account & Data Deletion: Request deletion anytime at $baseUrl/account-deletion.
         """.trimIndent()
 
         AlertDialog.Builder(this)
@@ -231,11 +234,11 @@ class MainActivity : AppCompatActivity() {
             .setMessage(message)
             .setCancelable(false)
             .setPositiveButton("Agree & Continue") { _, _ ->
-                prefs.edit().putBoolean("terms_disclosure_accepted_v1", true).apply()
+                prefs.edit().putBoolean("terms_disclosure_accepted_v2", true).apply()
                 webView.loadUrl(baseUrl)
             }
-            .setNeutralButton("Read Privacy Policy") { _, _ ->
-                val intent = Intent(Intent.ACTION_VIEW, Uri.parse("$baseUrl/privacy-policy"))
+            .setNeutralButton("Privacy & Terms") { _, _ ->
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse("$baseUrl/terms-and-conditions"))
                 startActivity(intent)
                 showFirstLaunchDisclosureDialog()
             }
@@ -434,6 +437,7 @@ class MainActivity : AppCompatActivity() {
                     )
                     val captureIntent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
                         putExtra(MediaStore.EXTRA_OUTPUT, cameraImageUri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
                     }
                     chooserIntents.add(captureIntent)
                 }

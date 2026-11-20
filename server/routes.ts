@@ -700,12 +700,20 @@ export function createApiRouter() {
 
   const resolvePublicOrigin = (req: Request): string => {
     const queryOrigin = typeof req.query.origin === 'string' ? req.query.origin.trim() : '';
+    let resolved = '';
     if (/^https?:\/\/[a-zA-Z0-9._:-]+$/.test(queryOrigin)) {
-      return queryOrigin.replace(/\/+$/, '');
+      resolved = queryOrigin.replace(/\/+$/, '');
+    } else {
+      const xfProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
+      const host = String(req.headers['x-forwarded-host'] || req.get('host') || '').split(',')[0].trim();
+      if (host && !host.startsWith('localhost') && !host.startsWith('127.0.0.1')) {
+        resolved = `${xfProto}://${host}`;
+      }
     }
-    const xfProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0].trim();
-    const host = String(req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000').split(',')[0].trim();
-    return `${xfProto}://${host}`;
+    if (!resolved || resolved.includes('localhost') || resolved.includes('127.0.0.1')) {
+      return 'https://ais-pre-qjijuhugfbwl3m7542cfsq-916287731082.asia-southeast1.run.app';
+    }
+    return resolved.replace('ais-dev-', 'ais-pre-');
   };
 
   // Raw Binary APK Upload / Delete (Super Admin Only — mounted BEFORE express.json)

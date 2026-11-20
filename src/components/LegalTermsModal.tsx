@@ -75,17 +75,21 @@ export const LegalTermsModal: React.FC<LegalTermsModalProps> = ({
                 <FileText className="w-4 h-4 text-[#EA580C]" />
                 Authorized CRM Usage Terms &amp; Conditions
               </div>
+              <p className="text-[11px] bg-slate-50 border border-slate-200 rounded-lg p-2.5 text-slate-600">
+                <strong>Head Office:</strong> 1st Floor, Anupam Complex, Pateri Road, Near Reliance Bazar, Satna, MP (485001) ·{' '}
+                <strong>Non-Lending CRM Notice:</strong> Internal business &amp; DSA operations CRM; loans are sanctioned exclusively by partner RBI-regulated Banks &amp; NBFCs.
+              </p>
               <p>
                 <strong>1. Authorized Accounts &amp; Hierarchy:</strong> Access to AMBIKA ASSOCIATE CRM is strictly for authorized staff and registered DSA/Referral Partners under the company hierarchy (1 Branch Manager → up to 10 Team Leaders → up to 10 Field Officers → up to 50 Referral Partners). Super Admin may disable or revoke any login ID at any time.
               </p>
               <p>
-                <strong>2. Mandatory Customer Consent:</strong> Users must confirm explicit customer consent before submitting leads, scanning PAN cards, uploading KYC documents, or recording follow-up conversations.
+                <strong>2. Daily GPS Attendance &amp; Leave Policy:</strong> Employees mark daily self-attendance via foreground GPS inside the Satna Head Office zone (reporting by 10:00 AM; delay after 10:00 AM attracts ₹20/day penalty). Leave &amp; lead-rejection approvals follow seniority escalation (Field Officer → Team Leader → Branch Manager → Super Admin); unapproved leave attracts ₹100/leave penalty.
               </p>
               <p>
-                <strong>3. Confidentiality &amp; Data Protection:</strong> Customer loan applications, mobile numbers, PAN details, and bank/NBFC records are confidential business records. Referral Partners only receive redacted progress updates. Unauthorized copying or external sharing is strictly prohibited.
+                <strong>3. Mandatory Customer Consent:</strong> Users must confirm explicit customer consent before submitting leads, scanning PAN cards, uploading KYC documents, or recording follow-up conversations.
               </p>
               <p>
-                <strong>4. SLA &amp; Accuracy:</strong> False leads, duplicate manipulation, or unapproved field claims are subject to automated SLA penalty review.
+                <strong>4. Confidentiality &amp; Data Protection:</strong> Customer loan applications, mobile numbers, PAN details, and bank/NBFC records are confidential business records. Referral Partners only receive redacted progress updates. Unauthorized copying or external sharing is strictly prohibited.
               </p>
             </div>
           )}
@@ -96,7 +100,7 @@ export const LegalTermsModal: React.FC<LegalTermsModalProps> = ({
                 Privacy Policy &amp; Encryption Standards
               </div>
               <p>
-                <strong>Data Collected:</strong> Employee/Partner ID, name, mobile, email, customer loan application fields, consented KYC/PAN scans, field visit GPS coordinates (when active), and optional consented follow-up call recordings.
+                <strong>Data Collected:</strong> Employee/Partner ID, name, mobile, email, daily office GPS attendance &amp; leave records, customer loan application fields, consented KYC/PAN scans, foreground-only field visit GPS coordinates, and optional consented follow-up call recordings.
               </p>
               <p>
                 <strong>Security:</strong> All API traffic is encrypted via HTTPS/TLS. Customer mobile numbers, PAN numbers, and addresses are encrypted at rest on the server, and passwords are hashed with bcrypt. We never sell user or customer data to third parties.
@@ -116,16 +120,16 @@ export const LegalTermsModal: React.FC<LegalTermsModalProps> = ({
                 Prominent Disclosure — Android App Permissions
               </div>
               <div className="p-3 rounded-lg border border-slate-200 bg-slate-50">
-                <strong>Camera:</strong> Used when tapping Quick Camera / Document Scanner to scan PAN cards (on-device OCR pre-fill) and capture geotagged field visit verification photos.
+                <strong>Precise Location (Foreground GPS Only):</strong> Used strictly while the app is open for Daily Office GPS Attendance (Satna Office zone) and Field Officer Visit / Bike Run mileage verification. No background location tracking.
               </div>
               <div className="p-3 rounded-lg border border-slate-200 bg-slate-50">
-                <strong>Precise Location (GPS + Foreground Service):</strong> Used during Field Officer check-in and active Bike Run mileage tracking with a visible notification and explicit GPS consent.
+                <strong>Camera:</strong> Used when tapping Quick Camera / Document Scanner to scan PAN cards (on-device OCR pre-fill) and capture geotagged field visit verification photos.
               </div>
               <div className="p-3 rounded-lg border border-slate-200 bg-slate-50">
                 <strong>Microphone (Record Audio):</strong> Used only when voluntarily recording a consented customer follow-up conversation (auto-deleted after 7 days).
               </div>
               <div className="p-3 rounded-lg border border-slate-200 bg-slate-50">
-                <strong>Phone Dialer (`tel:`):</strong> Launches your phone&apos;s dialer when tapping a customer mobile number for follow-up calling.
+                <strong>Phone Dialer (<code>tel:</code>):</strong> Launches your phone&apos;s dialer when tapping a customer mobile number for follow-up calling.
               </div>
             </div>
           )}
