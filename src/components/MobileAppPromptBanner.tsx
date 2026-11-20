@@ -72,20 +72,20 @@ export const MobileAppPromptBanner: React.FC<MobileAppPromptBannerProps> = ({
     <div className="bg-gradient-to-r from-[#0F2744] to-[#16365D] text-white border border-yellow-400/30 rounded-xl px-4 py-3 shadow-sm flex flex-wrap items-center justify-between gap-3">
       <div className="flex items-center gap-3 min-w-0">
         <img
-          src="/pwa-192x192.png"
+          src="/pwa-192x192.png?v=20261120"
           alt="AMBIKA ASSOCIATE App Icon"
-          className="w-10 h-10 rounded-xl border border-yellow-400/50 object-cover shrink-0 bg-[#0F2744]"
+          className="w-10 h-10 rounded-xl border border-yellow-400/50 object-cover shrink-0 bg-[#068220]"
         />
         <div className="min-w-0">
           <div className="text-xs sm:text-sm font-display font-bold truncate">
             {lang === 'hi'
-              ? 'AMBIKA ASSOCIATE मोबाइल ऐप (फुल वर्जन)'
-              : 'Install AMBIKA ASSOCIATE Full Mobile App'}
+              ? 'AMBIKA ASSOCIATE मोबाइल व डेस्कटॉप ऐप'
+              : 'AMBIKA ASSOCIATE Desktop & Mobile App'}
           </div>
           <div className="text-[11px] text-slate-300 truncate">
             {isIOS
-              ? 'iPhone / iPod Touch / iPad (iOS) Full App & Android APK ready'
-              : 'Android APK, iPhone / iPod (iOS) & Offline Field CRM'}
+              ? 'iPhone / iPod / iPad, Desktop Web Shortcut & Android APK ready'
+              : 'Desktop Browser / Shortcut, Android APK & iPhone (iOS) CRM'}
           </div>
         </div>
       </div>

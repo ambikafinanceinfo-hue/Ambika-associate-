@@ -100,7 +100,9 @@ export type AlertCategory =
   | 'Follow-up Reminder Alert'
   | 'Field Officer GPS Location Alert'
   | 'Complaint / Enquiry Alert'
-  | 'Duplicate Lead Verification Alert';
+  | 'Duplicate Lead Verification Alert'
+  | 'Attendance & Leave Alert'
+  | 'Admin Seniority Instruction';
 
 export const ALERT_CATEGORIES: AlertCategory[] = [
   'Lead Follow-up Alert',
@@ -109,12 +111,16 @@ export const ALERT_CATEGORIES: AlertCategory[] = [
   'Field Officer GPS Location Alert',
   'Complaint / Enquiry Alert',
   'Duplicate Lead Verification Alert',
+  'Attendance & Leave Alert',
+  'Admin Seniority Instruction',
 ];
 
 export type PenaltyType =
   | 'LEAD_ASSIGNMENT_10M'
   | 'FOLLOWUP_REMINDER_10M'
-  | 'ENQUIRY_SLA_60M';
+  | 'ENQUIRY_SLA_60M'
+  | 'ATTENDANCE_LATE_20'
+  | 'UNAPPROVED_LEAVE_100';
 
 export type ApprovalStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
 
@@ -138,6 +144,7 @@ export interface AuthUser {
   gpsConsent: boolean;
   cameraConsent: boolean;
   preferredLang: 'en' | 'hi';
+  profilePhotoDataUrl?: string | null;
 }
 
 export interface LeadRecord {
@@ -179,6 +186,22 @@ export interface LeadRecord {
   branchName: string | null;
   status: CaseStatus;
   lostReason?: string | null;
+  rejectedBy?: number | null;
+  rejectedByName?: string | null;
+  rejectedByCode?: string | null;
+  rejectedByRole?: UserRole | null;
+  rejectedAt?: string | null;
+  closureStatus?: 'NONE' | 'PENDING_APPROVAL' | 'APPROVED' | 'REJECTED_REOPENED' | null;
+  closureRequestedBy?: number | null;
+  closureRequestedByName?: string | null;
+  closureRequestedAt?: string | null;
+  closureApprovedBy?: number | null;
+  closureApprovedByName?: string | null;
+  closureApprovedAt?: string | null;
+  closureRemarks?: string | null;
+  expectedClosureApproverRole?: 'TEAM_LEADER' | 'BRANCH_MANAGER' | 'SUPER_ADMIN' | null;
+  expectedClosureApproverLabel?: string | null;
+  canApproveClosure?: boolean;
   existingEmi?: number | null;
   employmentType?: string | null;
   lastStatusAt: string | null;
@@ -335,9 +358,78 @@ export interface SystemSettings {
   hasUploadedApk?: boolean;
   apkFileName?: string | null;
   apkFileSize?: number | null;
+  hasUploadedAab?: boolean;
+  aabFileName?: string | null;
+  aabFileSize?: number | null;
   autoAssignIncomingLeads?: boolean;
   autoAssignMaxActiveLeads?: number;
   autoAssignGeoWeight?: number;
+  officeName?: string;
+  officeAddress?: string;
+  officeLatitude?: number;
+  officeLongitude?: number;
+  officeRadiusMeters?: number;
+  attendanceCutoffTime?: string;
+  attendanceLatePenaltyInr?: number;
+  unapprovedLeavePenaltyInr?: number;
+  seniorityInstructions?: string;
+  configVersion?: number;
+  appBuildVersion?: string;
+  lastSyncSummary?: string | null;
+  lastSyncUpdatedAt?: string | null;
+}
+
+export interface AttendanceRecord {
+  id: number;
+  attendanceCode: string;
+  employeeId: number;
+  employeeName: string;
+  employeeCode: string;
+  employeeRole: UserRole;
+  attendanceDate: string;
+  markedAt: string;
+  markedTimeIst: string;
+  latitude: number;
+  longitude: number;
+  accuracy: number | null;
+  locationLabel: string;
+  distanceMeters: number;
+  withinOffice: boolean;
+  autoCaptured: boolean;
+  status: 'PRESENT' | 'LATE_PRESENT';
+  selfApproved: boolean;
+  isLate: boolean;
+  delayMinutes: number;
+  delayPenaltyAmount: number;
+  penaltyId: number | null;
+  notes: string | null;
+  createdAt: string;
+}
+
+export interface LeaveRequestRecord {
+  id: number;
+  leaveCode: string;
+  employeeId: number;
+  employeeName: string;
+  employeeCode: string;
+  employeeRole: UserRole;
+  fromDate: string;
+  toDate: string;
+  totalDays: number;
+  leaveType: string;
+  reason: string;
+  approvalStatus: ApprovalStatus;
+  expectedApproverRole: 'TEAM_LEADER' | 'BRANCH_MANAGER' | 'SUPER_ADMIN';
+  expectedApproverLabel: string;
+  canReview: boolean;
+  reviewedBy: number | null;
+  reviewedByName: string | null;
+  reviewerRole: string | null;
+  reviewRemarks: string | null;
+  reviewedAt: string | null;
+  unapprovedPenaltyAmount: number;
+  penaltyId: number | null;
+  createdAt: string;
 }
 
 export interface SalesTargetRecord {
@@ -363,6 +455,13 @@ export interface FieldOfficerWorkload {
   branchCity: string | null;
   branchState: string | null;
   teamId: number | null;
+  teamName?: string | null;
+  teamLeaderId?: number | null;
+  teamLeaderName?: string | null;
+  teamLeaderCode?: string | null;
+  branchManagerId?: number | null;
+  branchManagerName?: string | null;
+  branchManagerCode?: string | null;
   serviceCity: string | null;
   servicePincodes: string | null;
   activeLeadCount: number;

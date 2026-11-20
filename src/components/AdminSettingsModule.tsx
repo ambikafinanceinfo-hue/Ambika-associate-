@@ -312,25 +312,38 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
     e.preventDefault();
     setMsg(null);
     setErrorMsg(null);
-    setCreatingUsers(true);
-    const submittedCode = newUser.employeeCode.trim().toUpperCase();
-    const submittedPass = newUser.password;
+    const submittedCode = newUser.employeeCode.trim().replace(/\s+/g, '').toUpperCase();
+    const submittedPass = newUser.password.trim();
     const submittedName = newUser.fullName.trim() || submittedCode;
     const submittedRole = newUser.role;
 
+    if (!submittedCode || !submittedPass) {
+      setErrorMsg('Employee Login ID and Password are required (spaces only are not allowed).');
+      return;
+    }
+
+    setCreatingUsers(true);
     try {
-      await apiFetch('/admin/users', {
+      const res = await apiFetch<{
+        ok: boolean;
+        created?: { employeeCode: string; password?: string; fullName: string; role: string };
+      }>('/admin/users', {
         method: 'POST',
         json: {
           ...newUser,
+          employeeCode: submittedCode,
+          password: submittedPass,
+          fullName: submittedName,
           reportsToUserId: newUser.reportsToUserId ? Number(newUser.reportsToUserId) : null,
         },
       });
+      const finalCode = res.created?.employeeCode || submittedCode;
+      const finalPass = res.created?.password || submittedPass;
       const freshUsers = await loadAll();
       setGeneratedCredentials((prev) => [
         {
-          employeeCode: submittedCode,
-          password: submittedPass,
+          employeeCode: finalCode,
+          password: finalPass,
           fullName: submittedName,
           role: submittedRole,
         },
@@ -346,7 +359,7 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
         reportsToUserId: pickDefaultParentId(prev.role, freshUsers),
         referralCode: '',
       }));
-      setMsg(`Employee Login ID "${submittedCode}" created with status ON.`);
+      setMsg(`Employee Login ID "${finalCode}" created (Status: ON). Ready to sign in with password "${finalPass}".`);
       if (!keepCreatingMore) {
         setShowCreatePanel(false);
       }
@@ -499,7 +512,9 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
         json: rules,
       });
       onSettingsUpdated(res.settings);
-      setMsg('System configuration saved and recorded in Audit Log.');
+      setMsg(
+        `Configuration saved & synced live (v${res.settings.configVersion ?? 1}) to all connected BM, Team Leader, Back Office & Field Officer apps.`
+      );
     } catch (err: any) {
       setMsg(`Error: ${err.message || 'Could not save settings'}`);
     }
@@ -808,9 +823,17 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                         ref={employeeCodeInputRef}
                         type="text"
                         required
+                        autoCapitalize="characters"
+                        autoCorrect="off"
+                        spellCheck={false}
                         value={newUser.employeeCode}
-                        onChange={(e) => setNewUser({ ...newUser, employeeCode: e.target.value.toUpperCase() })}
-                        placeholder="e.g. FO004 or EMP101"
+                        onChange={(e) =>
+                          setNewUser({
+                            ...newUser,
+                            employeeCode: e.target.value.replace(/\s+/g, '').toUpperCase(),
+                          })
+                        }
+                        placeholder="e.g. FO004 or TLPALAKGUPTA"
                         className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
                       />
                     </div>
@@ -833,9 +856,13 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                         <input
                           type={showPassword ? 'text' : 'password'}
                           required
+                          autoCapitalize="none"
+                          autoCorrect="off"
+                          autoComplete="new-password"
+                          spellCheck={false}
                           value={newUser.password}
                           onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
-                          placeholder="Create password"
+                          placeholder="Create password (no spaces)"
                           className="w-full px-3 py-2 pr-8 text-xs font-mono border border-slate-300 rounded-lg"
                         />
                         <button
@@ -1169,6 +1196,10 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                         <input
                           type="text"
                           required
+                          autoCapitalize="none"
+                          autoCorrect="off"
+                          autoComplete="new-password"
+                          spellCheck={false}
                           value={bulkForm.commonPassword}
                           onChange={(e) => setBulkForm({ ...bulkForm, commonPassword: e.target.value })}
                           placeholder="Initial password for all IDs"
@@ -1480,6 +1511,10 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                               <div className="flex items-center justify-end gap-1.5 pt-1">
                                 <input
                                   type="text"
+                                  autoCapitalize="none"
+                                  autoCorrect="off"
+                                  autoComplete="new-password"
+                                  spellCheck={false}
                                   value={resetPasswordDraft}
                                   onChange={(e) => setResetPasswordDraft(e.target.value)}
                                   placeholder="New password"
@@ -1784,6 +1819,110 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
 
             <div className="pt-3 border-t border-slate-100 space-y-3">
               <div className="text-xs font-semibold text-[#0F2744]">
+                Daily Self-Attendance (Ambika Office GPS Geofence) &amp; Leave Penalties
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="sm:col-span-2">
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                    Ambika Office Name
+                  </label>
+                  <input
+                    type="text"
+                    value={rules.officeName || 'AMBIKA ASSOCIATE Head Office'}
+                    onChange={(e) => setRules({ ...rules, officeName: e.target.value })}
+                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                    Allowed Radius (Meters)
+                  </label>
+                  <input
+                    type="number"
+                    min={50}
+                    value={rules.officeRadiusMeters ?? 500}
+                    onChange={(e) => setRules({ ...rules, officeRadiusMeters: Math.max(50, Number(e.target.value)) })}
+                    className="w-full px-3 py-1.5 text-xs font-mono border border-slate-300 rounded-lg tabular-nums"
+                  />
+                </div>
+                <div className="sm:col-span-3">
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                    Ambika Office Address
+                  </label>
+                  <input
+                    type="text"
+                    value={
+                      rules.officeAddress ||
+                      '1ST FLOR ANUPAM COMPLEX,PATERI ROAD,NEAR RELIANCE BAZAR,SATNA MP(485001)'
+                    }
+                    onChange={(e) => setRules({ ...rules, officeAddress: e.target.value })}
+                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                    Office Latitude
+                  </label>
+                  <input
+                    type="number"
+                    step="0.00001"
+                    value={rules.officeLatitude ?? 24.5819}
+                    onChange={(e) => setRules({ ...rules, officeLatitude: Number(e.target.value) })}
+                    className="w-full px-3 py-1.5 text-xs font-mono border border-slate-300 rounded-lg tabular-nums"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                    Office Longitude
+                  </label>
+                  <input
+                    type="number"
+                    step="0.00001"
+                    value={rules.officeLongitude ?? 80.7921}
+                    onChange={(e) => setRules({ ...rules, officeLongitude: Number(e.target.value) })}
+                    className="w-full px-3 py-1.5 text-xs font-mono border border-slate-300 rounded-lg tabular-nums"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                    Cutoff Time (IST 24h)
+                  </label>
+                  <input
+                    type="time"
+                    value={rules.attendanceCutoffTime || '10:00'}
+                    onChange={(e) => setRules({ ...rules, attendanceCutoffTime: e.target.value })}
+                    className="w-full px-3 py-1.5 text-xs font-mono border border-slate-300 rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                    Late Attendance Penalty (₹/day)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={rules.attendanceLatePenaltyInr ?? 20}
+                    onChange={(e) => setRules({ ...rules, attendanceLatePenaltyInr: Math.max(0, Number(e.target.value)) })}
+                    className="w-full px-3 py-1.5 text-xs font-mono border border-slate-300 rounded-lg tabular-nums"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                    Unapproved Leave Penalty (₹/leave)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    value={rules.unapprovedLeavePenaltyInr ?? 100}
+                    onChange={(e) => setRules({ ...rules, unapprovedLeavePenaltyInr: Math.max(0, Number(e.target.value)) })}
+                    className="w-full px-3 py-1.5 text-xs font-mono border border-slate-300 rounded-lg tabular-nums"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-3 border-t border-slate-100 space-y-3">
+              <div className="text-xs font-semibold text-[#0F2744]">
                 Mobile App Distribution (Google Play Store &amp; Direct Signed APK)
               </div>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -1814,6 +1953,27 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
               </div>
             </div>
 
+            <div className="pt-3 border-t border-slate-100 space-y-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <label className="text-xs font-semibold text-[#0F2744]">
+                  Seniority-Wise Instructions &amp; Live Broadcast Notice (Applies Automatically to All Apps)
+                </label>
+                <span className="text-[11px] font-mono text-slate-500 tabular-nums">
+                  Sync v{settings.configVersion ?? 1}
+                </span>
+              </div>
+              <textarea
+                rows={3}
+                value={rules.seniorityInstructions || ''}
+                onChange={(e) => setRules({ ...rules, seniorityInstructions: e.target.value })}
+                placeholder="Enter seniority instructions, attendance rules, petrol rules, or notices to broadcast immediately to BM, Team Leader, Back Office & Field Officer apps..."
+                className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg leading-relaxed"
+              />
+              <p className="text-[11px] text-slate-500">
+                Saving broadcasts this instruction immediately to all connected mobile &amp; desktop apps (BM, Team Leader, Back Office Lead Staff, and Field Officers) and sends an alert.
+              </p>
+            </div>
+
             <label className="flex items-center gap-2.5 text-xs font-medium text-slate-700 cursor-pointer pt-2">
               <input
                 type="checkbox"
@@ -1829,7 +1989,7 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                 type="submit"
                 className="px-5 py-2.5 rounded-lg bg-[#EA580C] hover:bg-[#C2410C] text-white text-xs font-semibold"
               >
-                Save Configuration
+                Save &amp; Sync Live to All Connected Apps
               </button>
             </div>
           </form>
@@ -1841,13 +2001,13 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
               </h2>
               <div className="flex items-center gap-3.5 p-3 rounded-lg bg-slate-50 border border-slate-200">
                 <img
-                  src="/pwa-512x512.png"
+                  src={settings.companyLogoDataUrl || '/pwa-512x512.png?v=20261120'}
                   alt="AMBIKA ASSOCIATE Mobile App Icon"
-                  className="w-14 h-14 rounded-xl border border-slate-300 object-cover shrink-0 bg-[#0F2744]"
+                  className="w-14 h-14 rounded-xl border border-yellow-400/50 object-cover shrink-0 bg-[#068220]"
                 />
                 <div className="text-xs text-slate-600 space-y-0.5 min-w-0">
                   <div className="font-semibold text-[#0F2744]">Mobile App Launcher Icon Ready</div>
-                  <div>Active across Android Home Screen, iOS Safari, Play Store Kit, and Portal Header.</div>
+                  <div>Active across Android Home Screen, iOS Safari, Play Store Kit, and all connected staff apps.</div>
                 </div>
               </div>
               <p className="text-xs text-slate-600">

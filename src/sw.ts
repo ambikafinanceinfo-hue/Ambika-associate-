@@ -41,6 +41,21 @@ try {
   // Dev mode where index.html is not precached falls back cleanly to network
 }
 
+// Always fetch fresh brand logos & icons from network first so downloaded apps show updated logo immediately
+registerRoute(
+  ({ url, request }) =>
+    request.method === 'GET' &&
+    /^\/(ambika-logo|pwa-|apple-touch-icon|icon\.svg|assets\/aistudio\/)/.test(url.pathname),
+  new NetworkFirst({
+    cacheName: 'ambika-brand-assets-v3',
+    networkTimeoutSeconds: 3,
+    plugins: [
+      new CacheableResponsePlugin({ statuses: [0, 200] }),
+      new ExpirationPlugin({ maxEntries: 30, maxAgeSeconds: 60 * 60 * 24 }),
+    ],
+  })
+);
+
 // Cache read-only API GETs (leads list, field officer directory, branding) for offline field viewing
 registerRoute(
   ({ url, request }) =>
@@ -267,10 +282,39 @@ sw.addEventListener('sync', (event: any) => {
   }
 });
 
-// Client message listener: flush queue immediately when app requests sync upon coming online
+// Client message listener: handle SW auto-update, cache clearing, and offline lead sync
 sw.addEventListener('message', (event: any) => {
   const data = event.data;
-  if (!data || data.type !== 'SYNC_QUEUED_LEADS') return;
+  if (!data) return;
+
+  if (data.type === 'SKIP_WAITING') {
+    sw.skipWaiting();
+    return;
+  }
+
+  if (data.type === 'CLEAR_STALE_CACHES') {
+    const replyPort = event.ports?.[0];
+    event.waitUntil(
+      caches
+        .keys()
+        .then((keys) =>
+          Promise.all(
+            keys
+              .filter((k) => k === 'ambika-api-read-cache' || k.startsWith('ambika-brand-assets'))
+              .map((k) => caches.delete(k))
+          )
+        )
+        .then(() => {
+          replyPort?.postMessage({ ok: true });
+        })
+        .catch(() => {
+          replyPort?.postMessage({ ok: false });
+        })
+    );
+    return;
+  }
+
+  if (data.type !== 'SYNC_QUEUED_LEADS') return;
   const replyPort = event.ports?.[0];
   event.waitUntil(
     flushOfflineLeadsInSw(data.authToken ?? null)

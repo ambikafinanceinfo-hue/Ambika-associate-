@@ -1,5 +1,17 @@
 import React, { useEffect, useState } from 'react';
-import { RefreshCw, ArrowUpRight, PhoneCall, Target, QrCode, ShieldCheck, UserPlus } from 'lucide-react';
+import { RefreshCw, ArrowUpRight, PhoneCall, Target, QrCode, ShieldCheck, UserPlus, BarChart3, PieChart as PieChartIcon, CalendarCheck2, CheckCircle2 } from 'lucide-react';
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+} from 'recharts';
 import type { AuthUser } from '../../shared/types';
 import { apiFetch, formatInr } from '../lib/api';
 import { t, type Lang } from '../lib/i18n';
@@ -17,6 +29,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
   const [salesOverview, setSalesOverview] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [chartMode, setChartMode] = useState<'bar' | 'donut'>('bar');
+  const [statusGranularity, setStatusGranularity] = useState<'grouped' | 'detailed'>('grouped');
 
   const load = async () => {
     setLoading(true);
@@ -37,6 +51,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
 
   useEffect(() => {
     load();
+    const handleLiveSync = () => {
+      void load();
+    };
+    window.addEventListener('ambika:live-sync', handleLiveSync);
+    return () => window.removeEventListener('ambika:live-sync', handleLiveSync);
   }, [user.id]);
 
   if (loading) {
@@ -101,7 +120,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
       <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4">
         <div className="flex flex-wrap items-center gap-4 min-w-0">
           <img
-            src={logoDataUrl || '/ambika-logo-banner.png'}
+            src={logoDataUrl || '/assets/aistudio/LOGO_AMBIKA_2025_FINAL_a8908f5d.jpg?v=20261120'}
             alt="AMBIKA ASSOCIATE — Smart Finance Smart Saving"
             referrerPolicy="no-referrer"
             className="h-14 sm:h-16 w-auto rounded-lg border border-slate-200 object-contain bg-white shrink-0 shadow-xs"
@@ -113,7 +132,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
             <div className="text-xs text-slate-500 mt-1 flex flex-wrap items-center gap-2">
               <span>{user.employeeCode}</span>
               <span aria-hidden="true">·</span>
-              <span>{user.role.replace('_', ' ')}</span>
+              <span>{user.role.replace(/_/g, ' ')}</span>
               {user.branchName && (
                 <>
                   <span aria-hidden="true">·</span>
@@ -130,6 +149,32 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+          {!isReferral && (
+            <button
+              type="button"
+              onClick={() => onNavigate('attendance', 'attendance')}
+              className={`inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg whitespace-nowrap shrink-0 transition-colors ${
+                data.todayAttendance?.marked
+                  ? 'bg-green-50 border border-green-300 text-[#15803D] hover:bg-green-100'
+                  : 'bg-[#15803D] hover:bg-green-800 text-white'
+              }`}
+            >
+              {data.todayAttendance?.marked ? (
+                <CheckCircle2 className="w-3.5 h-3.5" />
+              ) : (
+                <CalendarCheck2 className="w-3.5 h-3.5" />
+              )}
+              <span>
+                {data.todayAttendance?.marked
+                  ? lang === 'hi'
+                    ? `हाज़िरी दर्ज (${data.todayAttendance.markedTimeIst || 'आज'})`
+                    : `Attendance Marked (${data.todayAttendance.markedTimeIst || 'Today'})`
+                  : lang === 'hi'
+                  ? 'दैनिक उपस्थिति दर्ज करें'
+                  : 'Mark Daily Attendance'}
+              </span>
+            </button>
+          )}
           <button
             type="button"
             onClick={load}
@@ -178,6 +223,38 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
         </div>
       </div>
 
+      {/* Live Seniority Instructions & Admin Policy Notice (Synced Across All Connected Apps) */}
+      {!isReferral && data.settings?.seniorityInstructions && (
+        <div className="bg-white border border-slate-200 border-l-4 border-l-[#0F2744] rounded-xl px-4 py-3 flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1 space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-display font-bold text-[#0F2744]">
+                {lang === 'hi'
+                  ? 'एडमिन सीनियरिटी निर्देश एवं पॉलिसी'
+                  : 'Admin Seniority Instructions & Active Policy'}
+              </span>
+              {data.settings?.configVersion && (
+                <span className="text-[11px] font-mono text-slate-400 tabular-nums">
+                  v{data.settings.configVersion}
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-slate-700 leading-relaxed whitespace-pre-line">
+              {data.settings.seniorityInstructions}
+            </p>
+          </div>
+          {user.role === 'SUPER_ADMIN' && (
+            <button
+              type="button"
+              onClick={() => onNavigate('admin', 'rules')}
+              className="text-xs font-semibold text-[#EA580C] hover:underline whitespace-nowrap shrink-0"
+            >
+              Edit &amp; Broadcast
+            </button>
+          )}
+        </div>
+      )}
+
       {/* KPI Metrics Grid */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-3">
         {kpiCards.map((card) => (
@@ -197,6 +274,274 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
           </button>
         ))}
       </div>
+
+      {/* Lead Status Distribution Chart (Recharts) */}
+      {(() => {
+        const rawDist: { status: string; stageGroup: string; count: number }[] =
+          Array.isArray(data.statusDistribution) && data.statusDistribution.length > 0
+            ? data.statusDistribution
+            : [
+                { status: 'New', stageGroup: 'New', count: Number(kpis.pendingLeads || 0) },
+                {
+                  status: 'In-Progress',
+                  stageGroup: 'In-Progress',
+                  count: Number(kpis.docsPending || 0) + Number(kpis.casesLoggedIn || 0) + Number(kpis.underProcess || 0),
+                },
+                { status: 'Approved', stageGroup: 'Approved', count: Number(kpis.approvedCases || 0) },
+                { status: 'Disbursed', stageGroup: 'Disbursed', count: Number(kpis.disbursedCases || 0) },
+                { status: 'Rejected', stageGroup: 'Rejected', count: Number(kpis.rejectedCases || 0) },
+                { status: 'Closed', stageGroup: 'Closed', count: Number(kpis.closedCases || 0) },
+              ];
+
+        const STAGE_COLORS: Record<string, string> = {
+          New: '#0F2744',
+          'In-Progress': '#D97706',
+          Approved: '#0EA5E9',
+          Disbursed: '#15803D',
+          Rejected: '#DC2626',
+          Closed: '#64748B',
+        };
+
+        const groupedOrder = ['New', 'In-Progress', 'Approved', 'Disbursed', 'Rejected', 'Closed'];
+        const groupedData = groupedOrder.map((group) => {
+          const count = rawDist
+            .filter((item) => item.stageGroup === group)
+            .reduce((sum, item) => sum + Number(item.count || 0), 0);
+          return {
+            name: group,
+            count,
+            color: STAGE_COLORS[group] || '#0F2744',
+          };
+        });
+
+        const detailedData = rawDist
+          .filter((item) => Number(item.count || 0) > 0)
+          .map((item) => ({
+            name: item.status,
+            count: Number(item.count || 0),
+            color: STAGE_COLORS[item.stageGroup] || '#0F2744',
+          }));
+
+        const chartData =
+          statusGranularity === 'grouped'
+            ? groupedData
+            : detailedData.length > 0
+            ? detailedData
+            : groupedData;
+
+        const totalChartLeads = chartData.reduce((sum, item) => sum + item.count, 0);
+
+        return (
+          <section className="bg-white border border-slate-200 rounded-xl p-5">
+            <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-slate-100">
+              <div>
+                <h2 className="text-sm font-display font-bold text-[#0F2744]">
+                  {lang === 'hi' ? 'लीड स्थिति वितरण (Lead Status Distribution)' : 'Lead Status Distribution'}
+                </h2>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  <span className="font-mono tabular-nums font-semibold text-[#0F2744]">{totalChartLeads}</span>
+                  {' '}
+                  {lang === 'hi' ? 'कुल दृश्यमान लीड्स' : 'visible leads across pipeline stages'}
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                  <button
+                    type="button"
+                    onClick={() => setStatusGranularity('grouped')}
+                    className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                      statusGranularity === 'grouped'
+                        ? 'bg-white text-[#0F2744] shadow-xs'
+                        : 'text-slate-600 hover:text-[#0F2744]'
+                    }`}
+                  >
+                    {lang === 'hi' ? 'मुख्य चरण' : 'Key Stages'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setStatusGranularity('detailed')}
+                    className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                      statusGranularity === 'detailed'
+                        ? 'bg-white text-[#0F2744] shadow-xs'
+                        : 'text-slate-600 hover:text-[#0F2744]'
+                    }`}
+                  >
+                    {lang === 'hi' ? 'विस्तृत स्थिति' : 'All Statuses'}
+                  </button>
+                </div>
+
+                <div className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                  <button
+                    type="button"
+                    onClick={() => setChartMode('bar')}
+                    aria-label="Bar chart view"
+                    className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                      chartMode === 'bar'
+                        ? 'bg-white text-[#0F2744] shadow-xs'
+                        : 'text-slate-600 hover:text-[#0F2744]'
+                    }`}
+                  >
+                    <BarChart3 className="w-3.5 h-3.5" />
+                    <span>Bar</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setChartMode('donut')}
+                    aria-label="Donut chart view"
+                    className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                      chartMode === 'donut'
+                        ? 'bg-white text-[#0F2744] shadow-xs'
+                        : 'text-slate-600 hover:text-[#0F2744]'
+                    }`}
+                  >
+                    <PieChartIcon className="w-3.5 h-3.5" />
+                    <span>Donut</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {totalChartLeads === 0 ? (
+              <div className="py-10 text-center space-y-2.5">
+                <p className="text-xs text-slate-500">
+                  {lang === 'hi'
+                    ? 'चार्ट दिखाने के लिए अभी कोई लीड उपलब्ध नहीं है।'
+                    : 'No leads recorded in your scope yet to plot status distribution.'}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => onNavigate('leads')}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-[#EA580C] hover:bg-[#C2410C] text-white text-xs font-semibold transition-colors"
+                >
+                  + {t(lang, 'newLead')}
+                </button>
+              </div>
+            ) : (
+              <div className="mt-4 grid grid-cols-1 lg:grid-cols-12 gap-5 items-center">
+                <div className="lg:col-span-7 h-72 w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    {chartMode === 'bar' ? (
+                      <BarChart
+                        data={chartData}
+                        margin={{ top: 10, right: 16, left: -12, bottom: statusGranularity === 'detailed' ? 28 : 8 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="#E2E8F0" vertical={false} />
+                        <XAxis
+                          dataKey="name"
+                          tick={{ fontSize: 11, fill: '#475569' }}
+                          axisLine={{ stroke: '#CBD5E1' }}
+                          tickLine={false}
+                          interval={0}
+                          angle={statusGranularity === 'detailed' ? -20 : 0}
+                          textAnchor={statusGranularity === 'detailed' ? 'end' : 'middle'}
+                        />
+                        <YAxis
+                          allowDecimals={false}
+                          tick={{ fontSize: 11, fill: '#64748B' }}
+                          axisLine={false}
+                          tickLine={false}
+                        />
+                        <Tooltip
+                          cursor={{ fill: '#F8FAFC' }}
+                          content={({ active, payload }) => {
+                            if (!active || !payload?.length) return null;
+                            const entry = payload[0].payload as { name: string; count: number; color: string };
+                            const pct = totalChartLeads > 0 ? Math.round((entry.count / totalChartLeads) * 100) : 0;
+                            return (
+                              <div className="bg-white border border-slate-200 rounded-lg px-3 py-2 shadow-sm text-xs">
+                                <div className="font-semibold text-[#0F2744]">{entry.name}</div>
+                                <div className="mt-0.5 font-mono tabular-nums text-slate-700">
+                                  {entry.count} leads ({pct}%)
+                                </div>
+                              </div>
+                            );
+                          }}
+                        />
+                        <Bar
+                          dataKey="count"
+                          radius={[6, 6, 0, 0]}
+                          maxBarSize={48}
+                          onClick={() => onNavigate('leads')}
+                          className="cursor-pointer"
+                        >
+                          {chartData.map((entry) => (
+                            <Cell key={entry.name} fill={entry.color} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    ) : (
+                      <PieChart>
+                        <Pie
+                          data={chartData.filter((d) => d.count > 0)}
+                          dataKey="count"
+                          nameKey="name"
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={62}
+                          outerRadius={104}
+                          paddingAngle={2}
+                          onClick={() => onNavigate('leads')}
+                          className="cursor-pointer"
+                        >
+                          {chartData
+                            .filter((d) => d.count > 0)
+                            .map((entry) => (
+                              <Cell key={entry.name} fill={entry.color} />
+                            ))}
+                        </Pie>
+                        <Tooltip
+                          content={({ active, payload }) => {
+                            if (!active || !payload?.length) return null;
+                            const entry = payload[0].payload as { name: string; count: number };
+                            const pct = totalChartLeads > 0 ? Math.round((entry.count / totalChartLeads) * 100) : 0;
+                            return (
+                              <div className="bg-white border border-slate-200 rounded-lg px-3 py-2 shadow-sm text-xs">
+                                <div className="font-semibold text-[#0F2744]">{entry.name}</div>
+                                <div className="mt-0.5 font-mono tabular-nums text-slate-700">
+                                  {entry.count} leads ({pct}%)
+                                </div>
+                              </div>
+                            );
+                          }}
+                        />
+                      </PieChart>
+                    )}
+                  </ResponsiveContainer>
+                </div>
+
+                <div className="lg:col-span-5 divide-y divide-slate-100 border border-slate-100 rounded-lg">
+                  {chartData.map((item) => {
+                    const pct = totalChartLeads > 0 ? Math.round((item.count / totalChartLeads) * 100) : 0;
+                    return (
+                      <button
+                        key={item.name}
+                        type="button"
+                        onClick={() => onNavigate('leads')}
+                        className="w-full px-3.5 py-2.5 flex items-center justify-between gap-3 text-left hover:bg-slate-50 transition-colors"
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <span
+                            className="w-2.5 h-2.5 rounded-xs shrink-0"
+                            style={{ backgroundColor: item.color }}
+                            aria-hidden="true"
+                          />
+                          <span className="text-xs font-medium text-slate-800 truncate">{item.name}</span>
+                        </div>
+                        <div className="flex items-center gap-2 text-xs font-mono tabular-nums shrink-0">
+                          <span className="font-bold text-[#0F2744]">{item.count}</span>
+                          <span className="text-slate-400">·</span>
+                          <span className="text-slate-500 w-9 text-right">{pct}%</span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </section>
+        );
+      })()}
 
       {/* Penalty, Petrol & Staff Reward Points Summary Row (Hidden from Referral Partners) */}
       {!isReferral && (
@@ -328,14 +673,21 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
       )}
 
       {/* Performance Tables */}
-      {!isReferral && (
+      {!isReferral && (() => {
+        const isFieldOfficer = user.role === 'FIELD_OFFICER';
+        const visibleEmployeePerformance = isFieldOfficer
+          ? employeePerformance.filter((emp: any) => emp.id === user.id || emp.code === user.employeeCode)
+          : employeePerformance;
+        return (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
             <div className="px-5 py-3.5 border-b border-slate-200 flex items-center justify-between">
               <h2 className="text-sm font-display font-bold text-[#0F2744]">
                 Employee-wise Performance
               </h2>
-              <span className="text-xs text-slate-500">Field Officers</span>
+              <span className="text-xs text-slate-500">
+                {isFieldOfficer ? 'My Performance Only' : 'Field Officers'}
+              </span>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -348,7 +700,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {employeePerformance.map((emp: any) => (
+                  {visibleEmployeePerformance.map((emp: any) => (
                     <tr key={emp.id} className="hover:bg-slate-50">
                       <td className="px-4 py-2.5">
                         <div className="font-medium text-slate-900">{emp.name}</div>
@@ -363,7 +715,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
                       </td>
                     </tr>
                   ))}
-                  {employeePerformance.length === 0 && (
+                  {visibleEmployeePerformance.length === 0 && (
                     <tr>
                       <td colSpan={4} className="px-4 py-6 text-center text-xs text-slate-500">
                         No field officer records yet.
@@ -420,7 +772,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       {/* Sales Growth Quick Row: Priority Calls & Monthly Targets */}
       {!isReferral && salesOverview && (

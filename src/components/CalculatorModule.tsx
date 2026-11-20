@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Check, Copy, Download, MessageCircle, Sparkles } from 'lucide-react';
-import type { LoanProductConfig } from '../../shared/types';
+import type { LoanProductConfig, UserRole } from '../../shared/types';
 import { formatInr } from '../lib/api';
 import type { Lang } from '../lib/i18n';
 import {
@@ -11,6 +11,7 @@ import {
 
 interface CalculatorModuleProps {
   loanProducts: LoanProductConfig[];
+  userRole?: UserRole;
   lang?: Lang;
   activeOption?: string | null;
   onSelectOption?: (opt: string) => void;
@@ -18,10 +19,12 @@ interface CalculatorModuleProps {
 
 export const CalculatorModule: React.FC<CalculatorModuleProps> = ({
   loanProducts,
+  userRole,
   lang = 'en',
   activeOption,
   onSelectOption,
 }) => {
+  const isFieldOfficer = userRole === 'FIELD_OFFICER';
   const [selectedProductId, setSelectedProductId] = useState(
     activeOption && loanProducts.some((p) => p.id === activeOption)
       ? activeOption
@@ -118,7 +121,7 @@ export const CalculatorModule: React.FC<CalculatorModuleProps> = ({
     [activeProduct?.name, principal, monthlyIncome, existingEmi, employmentType, annualRate, tenureMonths]
   );
 
-  const bestBank = eligibility.recommendations[0]?.bank;
+  const bestBank = isFieldOfficer ? undefined : eligibility.recommendations[0]?.bank;
 
   const quoteText = useMemo(
     () =>
@@ -150,10 +153,14 @@ export const CalculatorModule: React.FC<CalculatorModuleProps> = ({
     <div className="space-y-6">
       <div>
         <h1 className="text-xl font-display font-bold text-[#0F2744]">
-          EMI, Bank Eligibility &amp; Quote Share Calculator
+          {isFieldOfficer
+            ? 'Loan EMI & Quote Share Calculator'
+            : 'EMI, Bank Eligibility & Quote Share Calculator'}
         </h1>
         <p className="text-xs text-slate-500 mt-1">
-          Calculate monthly EMI, check instant bank FOIR eligibility, and share branded AMBIKA ASSOCIATE quotes on WhatsApp or PNG card.
+          {isFieldOfficer
+            ? 'Calculate monthly EMI and share branded AMBIKA ASSOCIATE quotes on WhatsApp or PNG card.'
+            : 'Calculate monthly EMI, check instant bank FOIR eligibility, and share branded AMBIKA ASSOCIATE quotes on WhatsApp or PNG card.'}
         </p>
       </div>
 
@@ -235,48 +242,50 @@ export const CalculatorModule: React.FC<CalculatorModuleProps> = ({
             </div>
           </div>
 
-          <div className="pt-3 border-t border-slate-200 space-y-3">
-            <div className="text-xs font-semibold text-[#0F2744] flex items-center gap-1.5">
-              <Sparkles className="w-3.5 h-3.5 text-[#EA580C]" />
-              Customer Eligibility Inputs
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-[11px] font-semibold text-slate-600 mb-1">Monthly Income (₹)</label>
-                <input
-                  type="number"
-                  min={0}
-                  step={5000}
-                  value={monthlyIncome}
-                  onChange={(e) => setMonthlyIncome(Number(e.target.value))}
-                  className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
-                />
+          {!isFieldOfficer && (
+            <div className="pt-3 border-t border-slate-200 space-y-3">
+              <div className="text-xs font-semibold text-[#0F2744] flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-[#EA580C]" />
+                Customer Eligibility Inputs
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">Monthly Income (₹)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    step={5000}
+                    value={monthlyIncome}
+                    onChange={(e) => setMonthlyIncome(Number(e.target.value))}
+                    className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
+                  />
+                </div>
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-600 mb-1">Existing EMIs (₹)</label>
+                  <input
+                    type="number"
+                    min={0}
+                    step={1000}
+                    value={existingEmi}
+                    onChange={(e) => setExistingEmi(Number(e.target.value))}
+                    className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
+                  />
+                </div>
               </div>
               <div>
-                <label className="block text-[11px] font-semibold text-slate-600 mb-1">Existing EMIs (₹)</label>
-                <input
-                  type="number"
-                  min={0}
-                  step={1000}
-                  value={existingEmi}
-                  onChange={(e) => setExistingEmi(Number(e.target.value))}
-                  className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
-                />
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1">Employment Profile</label>
+                <select
+                  value={employmentType}
+                  onChange={(e) => setEmploymentType(e.target.value)}
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
+                >
+                  <option value="Salaried">Salaried</option>
+                  <option value="Self-Employed">Self-Employed / Professional</option>
+                  <option value="Business">Business Owner</option>
+                </select>
               </div>
             </div>
-            <div>
-              <label className="block text-[11px] font-semibold text-slate-600 mb-1">Employment Profile</label>
-              <select
-                value={employmentType}
-                onChange={(e) => setEmploymentType(e.target.value)}
-                className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
-              >
-                <option value="Salaried">Salaried</option>
-                <option value="Self-Employed">Self-Employed / Professional</option>
-                <option value="Business">Business Owner</option>
-              </select>
-            </div>
-          </div>
+          )}
         </div>
 
         <div className="lg:col-span-7 space-y-4">
@@ -358,47 +367,49 @@ export const CalculatorModule: React.FC<CalculatorModuleProps> = ({
             </div>
           </div>
 
-          {/* Pre-Eligibility & Top 3 Matched Banks */}
-          <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
-            <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-slate-100">
-              <div className="text-xs font-bold text-[#0F2744]">
-                Instant Pre-Eligibility &amp; Best Bank Matches
-              </div>
-              <div className="text-xs font-mono tabular-nums">
-                Max Eligible:{' '}
-                <strong className="text-[#15803D]">{formatInr(eligibility.maxEligibleAmount)}</strong> · FOIR:{' '}
-                <strong className={eligibility.totalFoirPct > 65 ? 'text-[#DC2626]' : 'text-[#0F2744]'}>
-                  {eligibility.totalFoirPct}%
-                </strong>{' '}
-                · Odds:{' '}
-                <strong
-                  className={
-                    eligibility.overallOdds === 'HIGH'
-                      ? 'text-[#15803D]'
-                      : eligibility.overallOdds === 'MODERATE'
-                      ? 'text-[#D97706]'
-                      : 'text-[#DC2626]'
-                  }
-                >
-                  {eligibility.overallOdds}
-                </strong>
-              </div>
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              {eligibility.recommendations.map((rec) => (
-                <div key={rec.bank} className="p-3 rounded-lg bg-slate-50 border border-slate-200 space-y-1 text-xs">
-                  <div className="font-semibold text-[#0F2744] flex items-center justify-between gap-1">
-                    <span className="truncate">{rec.bank}</span>
-                    <span className="font-mono text-[#EA580C]">{rec.indicativeRate}%</span>
-                  </div>
-                  <div className="text-[11px] text-slate-600">
-                    Cap: <span className="font-mono font-semibold">{formatInr(rec.maxEligibleAmount)}</span>
-                  </div>
-                  <div className="text-[11px] text-slate-500">{rec.reason}</div>
+          {/* Pre-Eligibility & Top 3 Matched Banks (hidden for Field Officers) */}
+          {!isFieldOfficer && (
+            <div className="bg-white border border-slate-200 rounded-xl p-5 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 border-b border-slate-100">
+                <div className="text-xs font-bold text-[#0F2744]">
+                  Instant Pre-Eligibility &amp; Best Bank Matches
                 </div>
-              ))}
+                <div className="text-xs font-mono tabular-nums">
+                  Max Eligible:{' '}
+                  <strong className="text-[#15803D]">{formatInr(eligibility.maxEligibleAmount)}</strong> · FOIR:{' '}
+                  <strong className={eligibility.totalFoirPct > 65 ? 'text-[#DC2626]' : 'text-[#0F2744]'}>
+                    {eligibility.totalFoirPct}%
+                  </strong>{' '}
+                  · Odds:{' '}
+                  <strong
+                    className={
+                      eligibility.overallOdds === 'HIGH'
+                        ? 'text-[#15803D]'
+                        : eligibility.overallOdds === 'MODERATE'
+                        ? 'text-[#D97706]'
+                        : 'text-[#DC2626]'
+                    }
+                  >
+                    {eligibility.overallOdds}
+                  </strong>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                {eligibility.recommendations.map((rec) => (
+                  <div key={rec.bank} className="p-3 rounded-lg bg-slate-50 border border-slate-200 space-y-1 text-xs">
+                    <div className="font-semibold text-[#0F2744] flex items-center justify-between gap-1">
+                      <span className="truncate">{rec.bank}</span>
+                      <span className="font-mono text-[#EA580C]">{rec.indicativeRate}%</span>
+                    </div>
+                    <div className="text-[11px] text-slate-600">
+                      Cap: <span className="font-mono font-semibold">{formatInr(rec.maxEligibleAmount)}</span>
+                    </div>
+                    <div className="text-[11px] text-slate-500">{rec.reason}</div>
+                  </div>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
 
           <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
             <div className="px-5 py-3 border-b border-slate-200 text-xs font-semibold text-[#0F2744]">

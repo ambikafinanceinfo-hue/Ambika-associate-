@@ -337,8 +337,9 @@ export const LeadLoadBalancerPanel: React.FC<LeadLoadBalancerPanelProps> = ({
           <table className="w-full text-xs">
             <thead className="bg-slate-50 text-slate-500 border-b border-slate-200">
               <tr>
-                <th className="text-left font-semibold px-4 py-3">Officer</th>
-                <th className="text-left font-semibold px-4 py-3">Branch &amp; Territory</th>
+                <th className="text-left font-semibold px-4 py-3">Field Officer</th>
+                <th className="text-left font-semibold px-4 py-3">Team Leader · Branch Manager</th>
+                <th className="text-left font-semibold px-4 py-3">Working Location &amp; Branch</th>
                 <th className="text-left font-semibold px-4 py-3">PIN Codes / Zones</th>
                 <th className="text-left font-semibold px-4 py-3">Active Workload</th>
                 <th className="text-right font-semibold px-4 py-3">Today / Urgent</th>
@@ -353,6 +354,14 @@ export const LeadLoadBalancerPanel: React.FC<LeadLoadBalancerPanelProps> = ({
                     <div className="font-semibold text-slate-900">{fo.fullName}</div>
                     <div className="font-mono text-[11px] text-slate-500">
                       {fo.employeeCode} · {fo.mobile}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3">
+                    <div className="text-xs font-semibold text-[#0F2744]">
+                      TL: {fo.teamLeaderName ? `${fo.teamLeaderName} (${fo.teamLeaderCode})` : 'Direct Branch'}
+                    </div>
+                    <div className="text-[11px] text-slate-600 mt-0.5">
+                      BM: {fo.branchManagerName ? `${fo.branchManagerName} (${fo.branchManagerCode})` : '—'}
                     </div>
                   </td>
                   <td className="px-4 py-3">

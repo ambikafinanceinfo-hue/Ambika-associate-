@@ -252,7 +252,7 @@ export const PenaltyRegisterView: React.FC<PenaltyRegisterProps> = ({ user, onCh
             SLA Penalty Register &amp; Admin Review
           </h1>
           <p className="text-xs text-slate-500 mt-0.5">
-            10-min Lead Assignment SLA (₹10), 10-min Follow-up SLA (₹10), and 1-hr Enquiry SLA (₹10). Requires Admin approval before finalization.
+            10-min Lead Assignment SLA (₹10), 10-min Follow-up SLA (₹10), 1-hr Enquiry SLA (₹10), Late Attendance &gt;10 AM (₹20/day), and Unapproved Leave (₹100/leave).
           </p>
         </div>
         <div className="flex items-center gap-2 text-xs text-slate-600">
@@ -301,6 +301,10 @@ export const PenaltyRegisterView: React.FC<PenaltyRegisterProps> = ({ user, onCh
                         ? 'Lead Assignment (10m)'
                         : p.penaltyType === 'FOLLOWUP_REMINDER_10M'
                         ? 'Follow-up Reminder (10m)'
+                        : p.penaltyType === 'ATTENDANCE_LATE_20'
+                        ? 'Late Attendance >10AM (₹20/day)'
+                        : p.penaltyType === 'UNAPPROVED_LEAVE_100'
+                        ? 'Unapproved Leave (₹100/leave)'
                         : 'Enquiry SLA (1 hr)'}
                     </td>
                     <td className="px-4 py-3 font-mono tabular-nums text-[11px] text-slate-600">

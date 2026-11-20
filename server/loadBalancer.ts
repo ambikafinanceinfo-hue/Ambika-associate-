@@ -33,10 +33,14 @@ const CITY_POSTAL_ZONES: Record<string, string[]> = {
   jaipur: ['302'],
   indore: ['452'],
   bhopal: ['462'],
+  satna: ['485'],
+  rewa: ['486'],
   lucknow: ['226'],
 };
 
 const CITY_HUB_COORDS: Record<string, { lat: number; lng: number }> = {
+  satna: { lat: 24.5773, lng: 80.8272 },
+  rewa: { lat: 24.5362, lng: 81.3037 },
   mumbai: { lat: 19.076, lng: 72.8777 },
   thane: { lat: 19.2183, lng: 72.9781 },
   'navi mumbai': { lat: 19.033, lng: 73.0297 },
@@ -109,9 +113,21 @@ export function getOfficerWorkloadSnapshots(options?: {
       .prepare(`
         SELECT u.id, u.employee_code as employeeCode, u.full_name as fullName, u.mobile, u.role,
           u.branch_id as branchId, b.name as branchName, b.city as branchCity, b.state as branchState,
-          u.team_id as teamId, u.service_city as serviceCity, u.service_pincodes as servicePincodes
+          u.team_id as teamId, t.name as teamName,
+          u.service_city as serviceCity, u.service_pincodes as servicePincodes,
+          tl.id as teamLeaderId, tl.full_name as teamLeaderName, tl.employee_code as teamLeaderCode,
+          bm.id as branchManagerId, bm.full_name as branchManagerName, bm.employee_code as branchManagerCode
         FROM users u
         LEFT JOIN branches b ON b.id = u.branch_id
+        LEFT JOIN teams t ON t.id = u.team_id
+        LEFT JOIN users tl ON tl.id = COALESCE(
+          CASE WHEN u.role = 'TEAM_LEADER' THEN u.id ELSE u.reports_to_user_id END,
+          t.leader_user_id
+        )
+        LEFT JOIN users bm ON bm.id = COALESCE(
+          tl.reports_to_user_id,
+          (SELECT bmu.id FROM users bmu WHERE bmu.role = 'BRANCH_MANAGER' AND bmu.branch_id = u.branch_id AND bmu.is_active = 1 LIMIT 1)
+        )
         WHERE u.is_active = 1 AND u.role IN (${placeholders})
         ORDER BY CASE WHEN u.role = 'FIELD_OFFICER' THEN 0 ELSE 1 END, u.full_name ASC
       `)
@@ -194,6 +210,13 @@ export function getOfficerWorkloadSnapshots(options?: {
       branchCity: o.branchCity ?? null,
       branchState: o.branchState ?? null,
       teamId: o.teamId ? Number(o.teamId) : null,
+      teamName: o.teamName ?? null,
+      teamLeaderId: o.teamLeaderId ? Number(o.teamLeaderId) : null,
+      teamLeaderName: o.teamLeaderName ?? null,
+      teamLeaderCode: o.teamLeaderCode ?? null,
+      branchManagerId: o.branchManagerId ? Number(o.branchManagerId) : null,
+      branchManagerName: o.branchManagerName ?? null,
+      branchManagerCode: o.branchManagerCode ?? null,
       serviceCity: o.serviceCity ?? o.branchCity ?? null,
       servicePincodes: o.servicePincodes ?? null,
       activeLeadCount,

@@ -122,8 +122,10 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
   const [sourceFilter, setSourceFilter] = useState<
-    'ALL' | 'REFERRAL' | 'REFERRAL_TODAY' | 'FIELD_OFFICER' | 'FO_TODAY' | 'BACK_OFFICE' | 'UNASSIGNED'
+    'ALL' | 'REFERRAL' | 'REFERRAL_TODAY' | 'FIELD_OFFICER' | 'FO_TODAY' | 'BACK_OFFICE' | 'UNASSIGNED' | 'PENDING_CLOSURE'
   >('ALL');
+  const [showFoRoster, setShowFoRoster] = useState<boolean>(user.role === 'LEAD_GENERATOR');
+  const [foRosterQuery, setFoRosterQuery] = useState('');
   const [directory, setDirectory] = useState<{
     branches: any[];
     teams?: any[];
@@ -231,6 +233,8 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
   const [previewDoc, setPreviewDoc] = useState<{ url: string; name: string; mime: string } | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [panOcrMsg, setPanOcrMsg] = useState<string | null>(null);
+  const [closureRemarks, setClosureRemarks] = useState('');
+  const [closureBusy, setClosureBusy] = useState(false);
 
   const isReferral = user.role === 'REFERRAL_PARTNER';
   const isAdmin = user.role === 'SUPER_ADMIN';
@@ -268,27 +272,41 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
     return allFos;
   }, [directory.fieldOfficers, isTeamLeader, isBranchManager, scopedTeamLeaders, user.id, user.teamId, user.branchId]);
 
-  const filteredCreateOfficers = useMemo(() => {
-    const q = createOfficerQuery.trim().toLowerCase();
-    if (!q) return scopedOfficers;
-    return scopedOfficers.filter(
-      (fo) =>
-        fo.fullName?.toLowerCase().includes(q) ||
-        fo.employeeCode?.toLowerCase().includes(q) ||
-        fo.branchName?.toLowerCase().includes(q)
-    );
-  }, [scopedOfficers, createOfficerQuery]);
+  const matchesOfficerQuery = (fo: any, rawQ: string) => {
+    const q = rawQ.trim().toLowerCase();
+    if (!q) return true;
+    return [
+      fo.fullName,
+      fo.employeeCode,
+      fo.mobile,
+      fo.teamLeaderName,
+      fo.teamLeaderCode,
+      fo.branchManagerName,
+      fo.branchManagerCode,
+      fo.serviceCity,
+      fo.servicePincodes,
+      fo.branchName,
+      fo.branchCity,
+      fo.workingLocation,
+    ]
+      .filter(Boolean)
+      .some((v) => String(v).toLowerCase().includes(q));
+  };
 
-  const filteredAssignOfficers = useMemo(() => {
-    const q = assignOfficerCodeQuery.trim().toLowerCase();
-    if (!q) return scopedOfficers;
-    return scopedOfficers.filter(
-      (fo) =>
-        fo.fullName?.toLowerCase().includes(q) ||
-        fo.employeeCode?.toLowerCase().includes(q) ||
-        fo.branchName?.toLowerCase().includes(q)
-    );
-  }, [scopedOfficers, assignOfficerCodeQuery]);
+  const filteredCreateOfficers = useMemo(
+    () => scopedOfficers.filter((fo) => matchesOfficerQuery(fo, createOfficerQuery)),
+    [scopedOfficers, createOfficerQuery]
+  );
+
+  const filteredAssignOfficers = useMemo(
+    () => scopedOfficers.filter((fo) => matchesOfficerQuery(fo, assignOfficerCodeQuery)),
+    [scopedOfficers, assignOfficerCodeQuery]
+  );
+
+  const filteredRosterOfficers = useMemo(
+    () => scopedOfficers.filter((fo) => matchesOfficerQuery(fo, foRosterQuery)),
+    [scopedOfficers, foRosterQuery]
+  );
 
   const loadLeads = async () => {
     setLoading(true);
@@ -801,6 +819,34 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
       onAlertsChanged();
     } catch (err: any) {
       setActionMsg(err.message);
+    }
+  };
+
+  const handleClosureDecision = async (decision: 'APPROVE_CLOSE' | 'REOPEN') => {
+    if (!detail) return;
+    setClosureBusy(true);
+    setActionMsg(null);
+    try {
+      const res = await apiFetch<{ status: CaseStatus }>(`/leads/${detail.lead.id}/closure-decision`, {
+        method: 'PATCH',
+        json: {
+          decision,
+          remarks: closureRemarks.trim() || undefined,
+        },
+      });
+      setClosureRemarks('');
+      setActionMsg(
+        decision === 'APPROVE_CLOSE'
+          ? `Seniority Close Approved: Lead ${detail.lead.leadCode} moved to ${res.status}.`
+          : `Lead ${detail.lead.leadCode} re-opened back to ${res.status}.`
+      );
+      await loadLeads();
+      await loadLeadDetail(detail.lead.id);
+      onAlertsChanged();
+    } catch (err: any) {
+      setActionMsg(err.message);
+    } finally {
+      setClosureBusy(false);
     }
   };
 
@@ -1380,7 +1426,7 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                         ...(isAdmin || isBranchManager
                           ? [{ id: 'TL', label: 'Assign Team Leader' }]
                           : []),
-                        ...(isAdmin || isTeamLeader || isBranchManager
+                        ...(isAdmin || isTeamLeader || isBranchManager || isBackOffice
                           ? [
                               { id: 'MANUAL', label: 'Pick Field Officer' },
                               { id: 'AUTO', label: 'Auto Load-Balance' },
@@ -1523,14 +1569,24 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                         }}
                         className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
                       >
-                        <option value="">Select Field Officer...</option>
+                        <option value="">Select Field Officer (FO · TL · BM · Working Location)...</option>
                         {filteredCreateOfficers.map((fo) => (
                           <option key={fo.id} value={fo.id}>
-                            {fo.fullName} — {fo.employeeCode}
-                            {fo.serviceCity || fo.branchName ? ` (${fo.serviceCity || fo.branchName})` : ''}
+                            {fo.fullName} ({fo.employeeCode}) · TL: {fo.teamLeaderName || '—'} · BM: {fo.branchManagerName || '—'} · Loc: {fo.serviceCity || fo.branchCity || fo.branchName || 'All'}
                           </option>
                         ))}
                       </select>
+                      {form.assignedOfficerId && (() => {
+                        const sel = scopedOfficers.find((fo) => String(fo.id) === form.assignedOfficerId);
+                        if (!sel) return null;
+                        return (
+                          <div className="mt-1.5 text-[11px] text-slate-600 bg-white border border-slate-200 rounded-md px-2.5 py-1.5">
+                            <strong>TL:</strong> {sel.teamLeaderName ? `${sel.teamLeaderName} (${sel.teamLeaderCode})` : 'Direct'} ·{' '}
+                            <strong>BM:</strong> {sel.branchManagerName ? `${sel.branchManagerName} (${sel.branchManagerCode})` : '—'} ·{' '}
+                            <strong>Location:</strong> {sel.workingLocation || sel.branchName || '—'}
+                          </div>
+                        );
+                      })()}
                     </div>
                   </div>
                 )}
@@ -1691,6 +1747,7 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                   { id: 'FIELD_OFFICER', label: 'Field Officer Generated' },
                   { id: 'BACK_OFFICE', label: 'Back Office Generated' },
                   { id: 'UNASSIGNED', label: 'Unassigned Pool' },
+                  { id: 'PENDING_CLOSURE', label: 'Rejected · Close Approval' },
                 ]
               : canAssign
                 ? [
@@ -1698,11 +1755,13 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                     { id: 'FO_TODAY', label: "Today's FO Leads" },
                     { id: 'FIELD_OFFICER', label: 'Field Officer Generated' },
                     { id: 'UNASSIGNED', label: 'Awaiting Next Assignment' },
+                    { id: 'PENDING_CLOSURE', label: 'Rejected · Close Approval' },
                   ]
                 : [
                     { id: 'ALL', label: 'All My Leads' },
                     { id: 'FO_TODAY', label: "Today's Self Leads" },
                     { id: 'FIELD_OFFICER', label: 'Self-Generated Leads' },
+                    { id: 'PENDING_CLOSURE', label: 'Rejected / Close Approval' },
                   ]
             ).map((tab) => (
               <button
@@ -1726,6 +1785,21 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {canAssign && (
+              <button
+                type="button"
+                onClick={() => setShowFoRoster((v) => !v)}
+                className={`inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors whitespace-nowrap shrink-0 ${
+                  showFoRoster
+                    ? 'bg-[#0F2744] text-white border-[#0F2744]'
+                    : 'bg-white text-[#0F2744] border-slate-300 hover:bg-slate-50'
+                }`}
+              >
+                <UserCheck className="w-3.5 h-3.5 text-[#EA580C]" />
+                FO Roster ({scopedOfficers.length})
+              </button>
+            )}
+
             {isAdmin && (
               <button
                 type="button"
@@ -1767,6 +1841,109 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                 Auto Load-Balancer
               </button>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* Field Officer Assignment Roster (Name · Team Leader · Branch Manager · Working Location) */}
+      {!isReferral && canAssign && showFoRoster && !showLoadBalancer && !showCallVault && (
+        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+          <div className="px-4 py-3 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3 bg-slate-50">
+            <div>
+              <h2 className="text-sm font-display font-bold text-[#0F2744]">
+                Field Officer Directory · Team Leader · Branch Manager · Working Location
+              </h2>
+              <p className="text-[11px] text-slate-500">
+                Verify reporting Team Leader (TL), Branch Manager (BM), and City/PIN coverage before assigning leads.
+              </p>
+            </div>
+            <input
+              type="text"
+              value={foRosterQuery}
+              onChange={(e) => setFoRosterQuery(e.target.value)}
+              placeholder="Search FO, TL, BM, City or PIN..."
+              className="w-full sm:w-64 px-3 py-1.5 text-xs border border-slate-300 rounded-lg bg-white"
+            />
+          </div>
+          <div className="overflow-x-auto max-h-64 overflow-y-auto">
+            <table className="w-full text-xs">
+              <thead className="bg-slate-50 text-slate-500 border-b border-slate-200 sticky top-0">
+                <tr>
+                  <th className="text-left font-semibold px-4 py-2.5">Field Officer</th>
+                  <th className="text-left font-semibold px-4 py-2.5">Team Leader (TL)</th>
+                  <th className="text-left font-semibold px-4 py-2.5">Branch Manager (BM)</th>
+                  <th className="text-left font-semibold px-4 py-2.5">Working Location &amp; PIN Zones</th>
+                  <th className="text-right font-semibold px-4 py-2.5">Action</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {filteredRosterOfficers.map((fo) => (
+                  <tr key={fo.id} className="hover:bg-slate-50">
+                    <td className="px-4 py-2.5 whitespace-nowrap">
+                      <div className="font-semibold text-[#0F2744]">{fo.fullName}</div>
+                      <div className="font-mono text-[11px] text-slate-500">
+                        {fo.employeeCode} · {fo.mobile}
+                      </div>
+                    </td>
+                    <td className="px-4 py-2.5 whitespace-nowrap">
+                      <div className="font-medium text-slate-800">
+                        {fo.teamLeaderName || '—'}
+                      </div>
+                      {fo.teamLeaderCode && (
+                        <div className="font-mono text-[10px] text-slate-500">{fo.teamLeaderCode}</div>
+                      )}
+                    </td>
+                    <td className="px-4 py-2.5 whitespace-nowrap">
+                      <div className="font-medium text-slate-800">
+                        {fo.branchManagerName || '—'}
+                      </div>
+                      {fo.branchManagerCode && (
+                        <div className="font-mono text-[10px] text-slate-500">{fo.branchManagerCode}</div>
+                      )}
+                    </td>
+                    <td className="px-4 py-2.5">
+                      <div className="font-medium text-[#0F2744]">
+                        {[fo.serviceCity || fo.branchCity, fo.branchName].filter(Boolean).join(' · ') || '—'}
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-500 max-w-xs truncate" title={fo.servicePincodes || ''}>
+                        {fo.servicePincodes || 'All branch zones'}
+                      </div>
+                    </td>
+                    <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAssignOfficerId(String(fo.id));
+                          setAssignOfficerCodeQuery(fo.employeeCode);
+                          setCreateAssignmentMode('MANUAL');
+                          setForm((prev) => ({
+                            ...prev,
+                            assignedOfficerId: String(fo.id),
+                            assignedOfficerEmployeeCode: fo.employeeCode,
+                            branchId: fo.branchId ? String(fo.branchId) : prev.branchId,
+                          }));
+                          setActionMsg(
+                            selectedLeadId
+                              ? `Selected ${fo.fullName} (${fo.employeeCode}) in Lead Routing Chain — click "Assign Field Officer" below.`
+                              : `Selected ${fo.fullName} (${fo.employeeCode}) for assignment.`
+                          );
+                        }}
+                        className="px-2.5 py-1 rounded border border-[#0F2744]/30 bg-white hover:bg-[#0F2744] hover:text-white text-[#0F2744] font-semibold transition-colors"
+                      >
+                        Select FO
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {filteredRosterOfficers.length === 0 && (
+                  <tr>
+                    <td colSpan={5} className="px-4 py-6 text-center text-slate-500">
+                      No Field Officers matched "{foRosterQuery}".
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
@@ -1940,6 +2117,11 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                         >
                           {lead.status}
                         </span>
+                        {lead.status === 'Rejected' && lead.closureStatus === 'PENDING_APPROVAL' && (
+                          <div className="text-[10px] font-medium text-[#EA580C] mt-0.5">
+                            Close Approval: {lead.expectedClosureApproverLabel || 'Senior'}
+                          </div>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -2220,7 +2402,7 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                         <UserCheck className="w-4 h-4 text-[#EA580C]" />
                         Lead Routing Chain (Back Office → BM → TL → Field Officer)
                       </div>
-                      {(isAdmin || isTeamLeader || isBranchManager) && (
+                      {(isAdmin || isTeamLeader || isBranchManager || isBackOffice) && (
                         <div className="flex items-center gap-1.5">
                           <button
                             type="button"
@@ -2305,11 +2487,11 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                       </div>
                     )}
 
-                    {/* Stage 3: Team Leader (or Super Admin / BM) assigns to Field Officer */}
-                    {(isTeamLeader || isAdmin || isBranchManager) && (
+                    {/* Stage 3: Team Leader / Back Office / BM / Admin assigns to Field Officer */}
+                    {(isTeamLeader || isAdmin || isBranchManager || isBackOffice) && (
                       <div className="p-2.5 rounded-lg bg-slate-50 border border-slate-200 space-y-2">
                         <div className="text-[11px] font-semibold text-[#0F2744]">
-                          Stage 3 · Team Leader → Assign Field Officer (10-min SLA)
+                          Stage 3 · Assign Field Officer with TL, BM &amp; Working Location (10-min SLA)
                         </div>
 
                         {detailCandidates && detailCandidates.length > 0 && (
@@ -2333,6 +2515,7 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                               >
                                 <span className="truncate">
                                   <strong>#{idx + 1} {cand.officer.fullName}</strong> ({cand.officer.employeeCode}) ·{' '}
+                                  TL: {cand.officer.teamLeaderName || '—'} · BM: {cand.officer.branchManagerName || '—'} ·{' '}
                                   {cand.geoMatchReasons[0]}
                                 </span>
                                 <span className="font-mono shrink-0">
@@ -2354,7 +2537,7 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                             );
                             if (exact) setAssignOfficerId(String(exact.id));
                           }}
-                          placeholder="Filter by Officer Name or enter Employee ID (e.g. FO001)"
+                          placeholder="Filter by FO Name, Code, TL, BM, City or PIN (e.g. FO001, Mumbai)"
                           className="w-full px-3 py-1.5 text-xs font-mono border border-slate-200 rounded-lg bg-white"
                         />
                         <div className="flex flex-col sm:flex-row gap-2">
@@ -2363,10 +2546,10 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                             onChange={(e) => setAssignOfficerId(e.target.value)}
                             className="flex-1 px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
                           >
-                            <option value="">Select Field Officer (Name · Employee ID)...</option>
+                            <option value="">Select Field Officer (FO · TL · BM · Working Location)...</option>
                             {filteredAssignOfficers.map((fo) => (
                               <option key={fo.id} value={fo.id}>
-                                {fo.fullName} — {fo.employeeCode}{fo.branchName ? ` (${fo.branchName})` : ''}
+                                {fo.fullName} ({fo.employeeCode}) · TL: {fo.teamLeaderName || '—'} · BM: {fo.branchManagerName || '—'} · Loc: {fo.serviceCity || fo.branchCity || fo.branchName || 'All'}
                               </option>
                             ))}
                           </select>
@@ -2378,6 +2561,17 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                             Assign Field Officer
                           </button>
                         </div>
+                        {assignOfficerId && (() => {
+                          const sel = scopedOfficers.find((fo) => String(fo.id) === assignOfficerId);
+                          if (!sel) return null;
+                          return (
+                            <div className="text-[11px] text-slate-600 bg-white border border-slate-200 rounded-md px-2.5 py-1.5">
+                              <strong>TL:</strong> {sel.teamLeaderName ? `${sel.teamLeaderName} (${sel.teamLeaderCode})` : 'Direct'} ·{' '}
+                              <strong>BM:</strong> {sel.branchManagerName ? `${sel.branchManagerName} (${sel.branchManagerCode})` : '—'} ·{' '}
+                              <strong>Working Location:</strong> {sel.workingLocation || sel.branchName || '—'}
+                            </div>
+                          );
+                        })()}
                       </div>
                     )}
 
@@ -2390,6 +2584,98 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                     />
                   </div>
                 )}
+
+                {/* Seniority Close Approval Panel for Rejected Leads */}
+                {!isReferral &&
+                  (detail.lead.status === 'Rejected' ||
+                    detail.lead.closureStatus === 'APPROVED' ||
+                    detail.lead.closureStatus === 'REJECTED_REOPENED') && (
+                    <div className="pt-3 border-t border-slate-200 space-y-2.5">
+                      <div className="p-3.5 rounded-lg bg-amber-50/70 border border-amber-200 space-y-2 text-xs">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="font-semibold text-[#0F2744]">
+                            Seniority Lead Close Approval (Rejected Case)
+                          </div>
+                          <span
+                            className={`font-semibold ${
+                              detail.lead.closureStatus === 'APPROVED'
+                                ? 'text-[#15803D]'
+                                : detail.lead.closureStatus === 'REJECTED_REOPENED'
+                                ? 'text-[#0F2744]'
+                                : 'text-[#EA580C]'
+                            }`}
+                          >
+                            {detail.lead.closureStatus === 'APPROVED'
+                              ? 'Close Approved'
+                              : detail.lead.closureStatus === 'REJECTED_REOPENED'
+                              ? 'Re-opened to Follow-up'
+                              : 'Pending Seniority Approval'}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-600">
+                          Seniority Rule: Field Officer → Team Leader | Team Leader → Branch Manager | Branch Manager → Super Admin
+                        </div>
+                        <div className="text-[11px] text-slate-700 space-y-0.5">
+                          {detail.lead.rejectedByName && (
+                            <div>
+                              Rejected By: <strong>{detail.lead.rejectedByName}</strong> ({detail.lead.rejectedByCode}) ·{' '}
+                              {detail.lead.rejectedByRole?.replace(/_/g, ' ')}
+                            </div>
+                          )}
+                          {detail.lead.lostReason && (
+                            <div>
+                              Rejection Reason: <strong className="text-[#DC2626]">{detail.lead.lostReason}</strong>
+                            </div>
+                          )}
+                          {detail.lead.expectedClosureApproverLabel && detail.lead.status === 'Rejected' && (
+                            <div>
+                              Required Close Approver: <strong className="text-[#0F2744]">{detail.lead.expectedClosureApproverLabel}</strong>
+                            </div>
+                          )}
+                          {detail.lead.closureApprovedByName && (
+                            <div>
+                              Reviewed By: <strong>{detail.lead.closureApprovedByName}</strong>
+                              {detail.lead.closureRemarks ? ` · ${detail.lead.closureRemarks}` : ''}
+                            </div>
+                          )}
+                        </div>
+
+                        {detail.lead.canApproveClosure ? (
+                          <div className="pt-1.5 space-y-2">
+                            <input
+                              type="text"
+                              value={closureRemarks}
+                              onChange={(e) => setClosureRemarks(e.target.value)}
+                              placeholder="Approval / re-open remarks (optional)"
+                              className="w-full px-3 py-1.5 text-xs border border-amber-300 rounded-lg bg-white"
+                            />
+                            <div className="flex flex-wrap gap-2">
+                              <button
+                                type="button"
+                                disabled={closureBusy}
+                                onClick={() => handleClosureDecision('APPROVE_CLOSE')}
+                                className="px-3.5 py-1.5 rounded-lg bg-[#15803D] hover:bg-green-800 disabled:opacity-50 text-white text-xs font-semibold"
+                              >
+                                Approve Close (Closed)
+                              </button>
+                              <button
+                                type="button"
+                                disabled={closureBusy}
+                                onClick={() => handleClosureDecision('REOPEN')}
+                                className="px-3.5 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-50 text-[#0F2744] text-xs font-semibold"
+                              >
+                                Re-open to Follow-up
+                              </button>
+                            </div>
+                          </div>
+                        ) : detail.lead.status === 'Rejected' ? (
+                          <div className="text-[11px] font-medium text-[#EA580C]">
+                            Awaiting Close Approval from {detail.lead.expectedClosureApproverLabel || 'Senior Manager'}. Only the assigned seniority approver can finalize Closed status.
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  )}
 
                 {/* Case Status Update (Blocked for Referral Partners) */}
                 {!isReferral && (
@@ -2414,6 +2700,11 @@ export const LeadsModule: React.FC<LeadsModuleProps> = ({
                         Update Status
                       </button>
                     </div>
+                    {newStatus === 'Closed' && (
+                      <div className="p-2 rounded bg-amber-50 border border-amber-200 text-[11px] text-amber-900">
+                        Seniority Approval Rule: Mark lead as <strong>Rejected</strong> first so your Seniority Approver (FO → Team Leader | TL → Branch Manager | BM → Super Admin) can approve closing it.
+                      </div>
+                    )}
                     {(newStatus === 'Rejected' || newStatus === 'Closed') && (
                       <div className="space-y-2">
                         <div>

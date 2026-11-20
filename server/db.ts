@@ -61,6 +61,7 @@ export function initDatabase() {
       service_city TEXT,
       service_pincodes TEXT,
       reports_to_user_id INTEGER REFERENCES users(id),
+      profile_photo_data_url TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -206,7 +207,7 @@ export function initDatabase() {
       employee_id INTEGER NOT NULL REFERENCES users(id),
       lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
       enquiry_id INTEGER,
-      penalty_type TEXT NOT NULL CHECK (penalty_type IN ('LEAD_ASSIGNMENT_10M','FOLLOWUP_REMINDER_10M','ENQUIRY_SLA_60M')),
+      penalty_type TEXT NOT NULL CHECK (penalty_type IN ('LEAD_ASSIGNMENT_10M','FOLLOWUP_REMINDER_10M','ENQUIRY_SLA_60M','ATTENDANCE_LATE_20','UNAPPROVED_LEAVE_100')),
       event_at TEXT NOT NULL,
       deadline_at TEXT NOT NULL,
       actual_update_at TEXT,
@@ -255,6 +256,11 @@ export function initDatabase() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       run_code TEXT NOT NULL UNIQUE,
       employee_id INTEGER NOT NULL REFERENCES users(id),
+      lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+      customer_name TEXT NOT NULL DEFAULT '',
+      tour_reason TEXT NOT NULL DEFAULT '',
+      start_location TEXT NOT NULL DEFAULT '',
+      end_location TEXT NOT NULL DEFAULT '',
       start_time TEXT NOT NULL,
       end_time TEXT,
       start_lat REAL NOT NULL,
@@ -267,11 +273,14 @@ export function initDatabase() {
       odometer_distance_km REAL NOT NULL DEFAULT 0,
       discrepancy_km REAL NOT NULL DEFAULT 0,
       discrepancy_flag INTEGER NOT NULL DEFAULT 0,
-      rate_per_km REAL NOT NULL DEFAULT 3.5,
+      rate_per_km REAL NOT NULL DEFAULT 3.0,
       eligible_km REAL NOT NULL DEFAULT 0,
+      gross_amount REAL NOT NULL DEFAULT 0,
+      deducted_amount REAL NOT NULL DEFAULT 0,
       incentive_amount REAL NOT NULL DEFAULT 0,
-      approval_status TEXT NOT NULL DEFAULT 'PENDING' CHECK (approval_status IN ('PENDING','APPROVED','REJECTED')),
+      approval_status TEXT NOT NULL DEFAULT 'PENDING' CHECK (approval_status IN ('PENDING','APPROVED','DEDUCTED','REJECTED')),
       reviewed_by INTEGER REFERENCES users(id),
+      reviewer_role TEXT,
       review_remarks TEXT,
       reviewed_at TEXT,
       route_points_json TEXT NOT NULL DEFAULT '[]',
@@ -361,6 +370,55 @@ export function initDatabase() {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_staff_rewards_milestone
       ON staff_rewards(lead_id, employee_id, entry_type, staff_bucket)
       WHERE entry_type IN ('DOC_LOGIN_REWARD', 'DISBURSEMENT_REWARD') AND lead_id IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS attendance_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      attendance_code TEXT NOT NULL UNIQUE,
+      employee_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      attendance_date TEXT NOT NULL,
+      marked_at TEXT NOT NULL,
+      marked_time_ist TEXT NOT NULL,
+      latitude REAL NOT NULL,
+      longitude REAL NOT NULL,
+      accuracy REAL,
+      location_label TEXT NOT NULL DEFAULT '',
+      distance_meters REAL NOT NULL DEFAULT 0,
+      within_office INTEGER NOT NULL DEFAULT 1,
+      auto_captured INTEGER NOT NULL DEFAULT 1,
+      status TEXT NOT NULL CHECK (status IN ('PRESENT','LATE_PRESENT')),
+      self_approved INTEGER NOT NULL DEFAULT 1,
+      is_late INTEGER NOT NULL DEFAULT 0,
+      delay_minutes INTEGER NOT NULL DEFAULT 0,
+      delay_penalty_amount REAL NOT NULL DEFAULT 0,
+      penalty_id INTEGER REFERENCES penalties(id) ON DELETE SET NULL,
+      notes TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(employee_id, attendance_date)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_attendance_emp_date ON attendance_logs(employee_id, attendance_date);
+
+    CREATE TABLE IF NOT EXISTS leave_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      leave_code TEXT NOT NULL UNIQUE,
+      employee_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      from_date TEXT NOT NULL,
+      to_date TEXT NOT NULL,
+      total_days INTEGER NOT NULL DEFAULT 1,
+      leave_type TEXT NOT NULL DEFAULT 'Casual Leave',
+      reason TEXT NOT NULL,
+      approval_status TEXT NOT NULL DEFAULT 'PENDING' CHECK (approval_status IN ('PENDING','APPROVED','REJECTED')),
+      expected_approver_role TEXT NOT NULL,
+      reviewed_by INTEGER REFERENCES users(id),
+      reviewer_role TEXT,
+      review_remarks TEXT,
+      reviewed_at TEXT,
+      unapproved_penalty_amount REAL NOT NULL DEFAULT 0,
+      penalty_id INTEGER REFERENCES penalties(id) ON DELETE SET NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_leaves_emp ON leave_requests(employee_id, approval_status);
   `);
 
   // Safe column migrations for existing SQLite files
@@ -380,6 +438,39 @@ export function initDatabase() {
   if (!leadCols.includes('assigned_tl_id')) {
     db.exec(`ALTER TABLE leads ADD COLUMN assigned_tl_id INTEGER REFERENCES users(id)`);
   }
+  if (!leadCols.includes('rejected_by')) {
+    db.exec(`ALTER TABLE leads ADD COLUMN rejected_by INTEGER REFERENCES users(id)`);
+  }
+  if (!leadCols.includes('rejected_by_role')) {
+    db.exec(`ALTER TABLE leads ADD COLUMN rejected_by_role TEXT`);
+  }
+  if (!leadCols.includes('rejected_at')) {
+    db.exec(`ALTER TABLE leads ADD COLUMN rejected_at TEXT`);
+  }
+  if (!leadCols.includes('closure_status')) {
+    db.exec(`ALTER TABLE leads ADD COLUMN closure_status TEXT DEFAULT 'NONE'`);
+  }
+  if (!leadCols.includes('closure_requested_by')) {
+    db.exec(`ALTER TABLE leads ADD COLUMN closure_requested_by INTEGER REFERENCES users(id)`);
+  }
+  if (!leadCols.includes('closure_requested_at')) {
+    db.exec(`ALTER TABLE leads ADD COLUMN closure_requested_at TEXT`);
+  }
+  if (!leadCols.includes('closure_approved_by')) {
+    db.exec(`ALTER TABLE leads ADD COLUMN closure_approved_by INTEGER REFERENCES users(id)`);
+  }
+  if (!leadCols.includes('closure_approved_at')) {
+    db.exec(`ALTER TABLE leads ADD COLUMN closure_approved_at TEXT`);
+  }
+  if (!leadCols.includes('closure_remarks')) {
+    db.exec(`ALTER TABLE leads ADD COLUMN closure_remarks TEXT`);
+  }
+  // Backfill any pre-existing Rejected leads so they enter Seniority Close Approval cleanly
+  db.exec(`
+    UPDATE leads
+    SET closure_status = 'PENDING_APPROVAL'
+    WHERE status = 'Rejected' AND (closure_status IS NULL OR closure_status = 'NONE')
+  `);
 
   // Safe migration for officer geographical area coverage & hierarchy parent columns
   const userCols = (db.prepare(`PRAGMA table_info(users)`).all() as { name: string }[]).map((c) => c.name);
@@ -391,6 +482,9 @@ export function initDatabase() {
   }
   if (!userCols.includes('reports_to_user_id')) {
     db.exec(`ALTER TABLE users ADD COLUMN reports_to_user_id INTEGER REFERENCES users(id)`);
+  }
+  if (!userCols.includes('profile_photo_data_url')) {
+    db.exec(`ALTER TABLE users ADD COLUMN profile_photo_data_url TEXT`);
   }
 
   // Safe migration for existing SQLite files where users.role CHECK lacked LEAD_GENERATOR or mobile had UNIQUE
@@ -421,17 +515,18 @@ export function initDatabase() {
         service_city TEXT,
         service_pincodes TEXT,
         reports_to_user_id INTEGER REFERENCES users(id),
+        profile_photo_data_url TEXT,
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
       INSERT INTO users_migrated (
         id, employee_code, full_name, mobile, email, password_hash, role,
         branch_id, team_id, referral_code, is_active, otp_enabled, gps_consent, camera_consent,
-        preferred_lang, service_city, service_pincodes, reports_to_user_id, created_at
+        preferred_lang, service_city, service_pincodes, reports_to_user_id, profile_photo_data_url, created_at
       )
       SELECT
         id, employee_code, full_name, COALESCE(mobile, ''), email, password_hash, role,
         branch_id, team_id, referral_code, is_active, otp_enabled, gps_consent, camera_consent,
-        preferred_lang, service_city, service_pincodes, reports_to_user_id, created_at
+        preferred_lang, service_city, service_pincodes, reports_to_user_id, NULL, created_at
       FROM users;
       DROP TABLE users;
       ALTER TABLE users_migrated RENAME TO users;
@@ -440,7 +535,157 @@ export function initDatabase() {
     db.pragma('foreign_keys = ON');
   }
 
+  // Safe migration for bike_runs to support DEDUCTED status, tour/customer/location details & billing breakdown
+  const bikeRunsSqlRow = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'bike_runs'`).get() as { sql?: string } | undefined;
+  const bikeCols = (db.prepare(`PRAGMA table_info(bike_runs)`).all() as { name: string }[]).map((c) => c.name);
+  if (
+    bikeRunsSqlRow?.sql &&
+    (!bikeRunsSqlRow.sql.includes('DEDUCTED') || !bikeCols.includes('customer_name') || !bikeCols.includes('gross_amount'))
+  ) {
+    db.pragma('foreign_keys = OFF');
+    db.exec(`
+      BEGIN;
+      CREATE TABLE bike_runs_migrated (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_code TEXT NOT NULL UNIQUE,
+        employee_id INTEGER NOT NULL REFERENCES users(id),
+        lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+        customer_name TEXT NOT NULL DEFAULT '',
+        tour_reason TEXT NOT NULL DEFAULT '',
+        start_location TEXT NOT NULL DEFAULT '',
+        end_location TEXT NOT NULL DEFAULT '',
+        start_time TEXT NOT NULL,
+        end_time TEXT,
+        start_lat REAL NOT NULL,
+        start_lng REAL NOT NULL,
+        end_lat REAL,
+        end_lng REAL,
+        opening_odometer REAL NOT NULL,
+        closing_odometer REAL,
+        gps_distance_km REAL NOT NULL DEFAULT 0,
+        odometer_distance_km REAL NOT NULL DEFAULT 0,
+        discrepancy_km REAL NOT NULL DEFAULT 0,
+        discrepancy_flag INTEGER NOT NULL DEFAULT 0,
+        rate_per_km REAL NOT NULL DEFAULT 3.0,
+        eligible_km REAL NOT NULL DEFAULT 0,
+        gross_amount REAL NOT NULL DEFAULT 0,
+        deducted_amount REAL NOT NULL DEFAULT 0,
+        incentive_amount REAL NOT NULL DEFAULT 0,
+        approval_status TEXT NOT NULL DEFAULT 'PENDING' CHECK (approval_status IN ('PENDING','APPROVED','DEDUCTED','REJECTED')),
+        reviewed_by INTEGER REFERENCES users(id),
+        reviewer_role TEXT,
+        review_remarks TEXT,
+        reviewed_at TEXT,
+        route_points_json TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','COMPLETED'))
+      );
+      INSERT INTO bike_runs_migrated (
+        id, run_code, employee_id, lead_id, customer_name, tour_reason, start_location, end_location,
+        start_time, end_time, start_lat, start_lng, end_lat, end_lng,
+        opening_odometer, closing_odometer, gps_distance_km, odometer_distance_km, discrepancy_km, discrepancy_flag,
+        rate_per_km, eligible_km, gross_amount, deducted_amount, incentive_amount,
+        approval_status, reviewed_by, reviewer_role, review_remarks, reviewed_at, route_points_json, status
+      )
+      SELECT
+        id, run_code, employee_id, NULL, '', '',
+        printf('%.4f, %.4f', start_lat, start_lng),
+        CASE WHEN end_lat IS NOT NULL AND end_lng IS NOT NULL THEN printf('%.4f, %.4f', end_lat, end_lng) ELSE '' END,
+        start_time, end_time, start_lat, start_lng, end_lat, end_lng,
+        opening_odometer, closing_odometer, gps_distance_km, odometer_distance_km, discrepancy_km, discrepancy_flag,
+        rate_per_km, eligible_km,
+        ROUND(COALESCE(eligible_km, 0) * COALESCE(rate_per_km, 3.0), 2),
+        0,
+        incentive_amount,
+        approval_status, reviewed_by, NULL, review_remarks, reviewed_at, route_points_json, status
+      FROM bike_runs;
+      DROP TABLE bike_runs;
+      ALTER TABLE bike_runs_migrated RENAME TO bike_runs;
+      COMMIT;
+    `);
+    db.pragma('foreign_keys = ON');
+  }
+
+  // Safe migration for penalties CHECK constraint to allow ATTENDANCE_LATE_20 & UNAPPROVED_LEAVE_100
+  const penaltiesSqlRow = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'penalties'`).get() as { sql?: string } | undefined;
+  if (penaltiesSqlRow?.sql && !penaltiesSqlRow.sql.includes('ATTENDANCE_LATE_20')) {
+    db.pragma('foreign_keys = OFF');
+    db.exec(`
+      BEGIN;
+      CREATE TABLE penalties_migrated (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        penalty_code TEXT NOT NULL UNIQUE,
+        employee_id INTEGER NOT NULL REFERENCES users(id),
+        lead_id INTEGER REFERENCES leads(id) ON DELETE SET NULL,
+        enquiry_id INTEGER,
+        penalty_type TEXT NOT NULL CHECK (penalty_type IN ('LEAD_ASSIGNMENT_10M','FOLLOWUP_REMINDER_10M','ENQUIRY_SLA_60M','ATTENDANCE_LATE_20','UNAPPROVED_LEAVE_100')),
+        event_at TEXT NOT NULL,
+        deadline_at TEXT NOT NULL,
+        actual_update_at TEXT,
+        delay_seconds INTEGER NOT NULL DEFAULT 0,
+        amount REAL NOT NULL DEFAULT 10,
+        approval_status TEXT NOT NULL DEFAULT 'PENDING' CHECK (approval_status IN ('PENDING','APPROVED','REJECTED')),
+        reviewed_by INTEGER REFERENCES users(id),
+        review_remarks TEXT,
+        reviewed_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      INSERT INTO penalties_migrated (
+        id, penalty_code, employee_id, lead_id, enquiry_id, penalty_type, event_at, deadline_at,
+        actual_update_at, delay_seconds, amount, approval_status, reviewed_by, review_remarks, reviewed_at, created_at
+      )
+      SELECT
+        id, penalty_code, employee_id, lead_id, enquiry_id, penalty_type, event_at, deadline_at,
+        actual_update_at, delay_seconds, amount, approval_status, reviewed_by, review_remarks, reviewed_at, created_at
+      FROM penalties;
+      DROP TABLE penalties;
+      ALTER TABLE penalties_migrated RENAME TO penalties;
+      COMMIT;
+    `);
+    db.pragma('foreign_keys = ON');
+  }
+
   seedInitialOrgAndSettings();
+  db.prepare(`UPDATE users SET full_name = 'Ruchi Gupta' WHERE employee_code = 'ADM001' AND full_name = 'Rajesh Sharma'`).run();
+  // Update default Head Office branch & official office address to Satna MP (485001)
+  db.prepare(`
+    UPDATE branches
+    SET code = 'HQ-STA',
+        name = 'Satna Head Office',
+        city = 'Satna',
+        state = 'Madhya Pradesh'
+    WHERE (code = 'HQ-MUM' OR name = 'Mumbai Head Office') AND city = 'Mumbai'
+  `).run();
+  db.prepare(`UPDATE teams SET name = 'Satna Retail Loans Alpha' WHERE name = 'Mumbai Retail Loans Alpha'`).run();
+  db.prepare(`UPDATE teams SET name = 'Satna Mortgage & LAP Bravo' WHERE name = 'Mumbai Mortgage & LAP Bravo'`).run();
+  db.prepare(`
+    INSERT OR IGNORE INTO settings (key, value_json)
+    VALUES ('officeAddress', ?)
+  `).run(JSON.stringify(OFFICIAL_OFFICE_ADDRESS));
+  db.prepare(`
+    INSERT OR IGNORE INTO settings (key, value_json)
+    VALUES ('seniorityInstructions', ?)
+  `).run(JSON.stringify(DEFAULT_SENIORITY_INSTRUCTIONS));
+  db.prepare(`
+    INSERT OR IGNORE INTO settings (key, value_json)
+    VALUES ('configVersion', '1')
+  `).run();
+  // Migrate uncalibrated city-center / Mumbai defaults to Satna Pateri Road Anupam Complex (24.5819, 80.7921)
+  db.prepare(`UPDATE settings SET value_json = '24.5819' WHERE key = 'officeLatitude' AND value_json IN ('19.076', '19.0760', '24.5773')`).run();
+  db.prepare(`UPDATE settings SET value_json = '80.7921' WHERE key = 'officeLongitude' AND value_json IN ('72.8777', '80.8272')`).run();
+  db.prepare(`UPDATE settings SET value_json = '500' WHERE key = 'officeRadiusMeters' AND value_json = '300'`).run();
+  // Enforce configured ₹3.00/km petrol rate across existing databases
+  db.prepare(`UPDATE settings SET value_json = '3' WHERE key = 'petrolRatePerKm' AND value_json IN ('3.5', '"3.5"')`).run();
+  db.prepare(`
+    UPDATE bike_runs
+    SET rate_per_km = 3.0,
+        gross_amount = ROUND(eligible_km * 3.0, 2),
+        incentive_amount = ROUND(eligible_km * 3.0, 2),
+        customer_name = CASE WHEN customer_name = '' THEN 'Ramesh Chandra Tiwari' ELSE customer_name END,
+        tour_reason = CASE WHEN tour_reason = '' THEN 'Loan Agreement & KYC Document Pickup' ELSE tour_reason END,
+        start_location = CASE WHEN start_location IN ('', '19.0760, 72.8777') THEN 'Satna Head Office (24.5819, 80.7921)' ELSE start_location END,
+        end_location = CASE WHEN end_location IN ('', '19.1364, 72.8296') THEN 'Pateri Road, Satna (24.5835, 80.7950)' ELSE end_location END
+    WHERE run_code = 'RUN-0001' AND approval_status = 'PENDING' AND rate_per_km = 3.5
+  `).run();
   seedOfficerTerritoriesIfNeeded();
   seedSalesExtensionsIfNeeded();
   seedHierarchyLinksIfNeeded();
@@ -529,19 +774,27 @@ const DEFAULT_LOAN_PRODUCTS: LoanProductConfig[] = [
   { id: 'gold_loan', name: 'Gold / Working Capital', defaultRate: 10.5, minTenureMonths: 3, maxTenureMonths: 36, commissionPct: 0.5 },
 ];
 
+export const APP_BUILD_VERSION = '2026.11.20-v3';
+
+export const OFFICIAL_OFFICE_ADDRESS =
+  '1ST FLOR ANUPAM COMPLEX,PATERI ROAD,NEAR RELIANCE BAZAR,SATNA MP(485001)';
+
+export const DEFAULT_SENIORITY_INSTRUCTIONS =
+  'Seniority Policy: Field Officer -> Team Leader | Team Leader & Back Office Lead Gen -> Branch Manager | Branch Manager -> Super Admin (Ruchi Gupta). Daily Self-Attendance turns GREEN ON inside Ambika Office GPS up to 10:00 AM IST (₹20/day late penalty after 10 AM). Unapproved leave penalty ₹100/leave. Petrol conveyance rate ₹3.00/km.';
+
 function seedInitialOrgAndSettings() {
   const branchCount = (db.prepare('SELECT COUNT(*) as c FROM branches').get() as { c: number }).c;
   if (branchCount === 0) {
     const insertBranch = db.prepare(
       'INSERT INTO branches (code, name, city, state) VALUES (?, ?, ?, ?)'
     );
-    const b1 = insertBranch.run('HQ-MUM', 'Mumbai Head Office', 'Mumbai', 'Maharashtra').lastInsertRowid as number;
+    const b1 = insertBranch.run('HQ-STA', 'Satna Head Office', 'Satna', 'Madhya Pradesh').lastInsertRowid as number;
     const b2 = insertBranch.run('BR-PUN', 'Pune Regional Branch', 'Pune', 'Maharashtra').lastInsertRowid as number;
     const b3 = insertBranch.run('BR-SUR', 'Surat Commercial Branch', 'Surat', 'Gujarat').lastInsertRowid as number;
 
     const insertTeam = db.prepare('INSERT INTO teams (branch_id, name) VALUES (?, ?)');
-    const t1 = insertTeam.run(b1, 'Mumbai Retail Loans Alpha').lastInsertRowid as number;
-    const t2 = insertTeam.run(b1, 'Mumbai Mortgage & LAP Bravo').lastInsertRowid as number;
+    const t1 = insertTeam.run(b1, 'Satna Retail Loans Alpha').lastInsertRowid as number;
+    const t2 = insertTeam.run(b1, 'Satna Mortgage & LAP Bravo').lastInsertRowid as number;
     const t3 = insertTeam.run(b2, 'Pune Field Sales Unit').lastInsertRowid as number;
 
     const insertUser = db.prepare(`
@@ -556,7 +809,7 @@ function seedInitialOrgAndSettings() {
     const backofficeHash = bcrypt.hashSync('Backoffice@123', 10);
     const refHash = bcrypt.hashSync('Referral@123', 10);
 
-    insertUser.run('ADM001', 'Rajesh Sharma', '9800000001', 'admin@ambikaassociate.in', adminHash, 'SUPER_ADMIN', b1, null, null);
+    insertUser.run('ADM001', 'Ruchi Gupta', '9800000001', 'admin@ambikaassociate.in', adminHash, 'SUPER_ADMIN', b1, null, null);
     insertUser.run('BM001', 'Vikram Patel', '9800000002', 'vikram.bm@ambikaassociate.in', branchHash, 'BRANCH_MANAGER', b1, null, null);
     const tlId = insertUser.run('TL001', 'Neha Kulkarni', '9800000003', 'neha.tl@ambikaassociate.in', leaderHash, 'TEAM_LEADER', b1, t1, null).lastInsertRowid as number;
     db.prepare('UPDATE teams SET leader_user_id = ? WHERE id = ?').run(tlId, t1);
@@ -569,7 +822,7 @@ function seedInitialOrgAndSettings() {
     insertUser.run('REF002', 'Priya Mehta', '9800000007', 'priya.dsa@ambikaassociate.in', refHash, 'REFERRAL_PARTNER', b2, t3, 'REF-AA-102');
 
     const defaultSettings: Record<string, unknown> = {
-      petrolRatePerKm: 3.5,
+      petrolRatePerKm: 3.0,
       assignmentSlaMinutes: 10,
       followupSlaMinutes: 10,
       enquirySlaMinutes: 60,
@@ -581,6 +834,18 @@ function seedInitialOrgAndSettings() {
       autoAssignIncomingLeads: true,
       autoAssignMaxActiveLeads: 25,
       autoAssignGeoWeight: 60,
+      officeName: 'AMBIKA ASSOCIATE Head Office',
+      officeAddress: OFFICIAL_OFFICE_ADDRESS,
+      officeLatitude: 24.5819,
+      officeLongitude: 80.7921,
+      officeRadiusMeters: 500,
+      attendanceCutoffTime: '10:00',
+      attendanceLatePenaltyInr: 20,
+      unapprovedLeavePenaltyInr: 100,
+      seniorityInstructions: DEFAULT_SENIORITY_INSTRUCTIONS,
+      configVersion: 1,
+      lastSyncSummary: 'Initial Ambika Associate Satna configuration active',
+      lastSyncUpdatedAt: new Date().toISOString(),
       loanProducts: DEFAULT_LOAN_PRODUCTS,
     };
 
@@ -612,20 +877,29 @@ export function getSettings(): SystemSettings {
   const rawProducts = Array.isArray(map.loanProducts)
     ? (map.loanProducts as LoanProductConfig[])
     : DEFAULT_LOAN_PRODUCTS;
-  const loanProducts = rawProducts.map((p) => {
+  const normalizedProducts = rawProducts.map((p) => {
     const def = DEFAULT_LOAN_PRODUCTS.find((d) => d.id === p.id || d.name === p.name);
     return {
       ...p,
       commissionPct: p.commissionPct ?? def?.commissionPct ?? 0.5,
     };
   });
+  const hasAutoLoan = normalizedProducts.some(
+    (p) => p.id === 'auto_loan' || /auto|commercial vehicle/i.test(p.name)
+  );
+  const autoDefault = DEFAULT_LOAN_PRODUCTS.find((d) => d.id === 'auto_loan')!;
+  const loanProducts = hasAutoLoan ? normalizedProducts : [...normalizedProducts, autoDefault];
 
   const hostedApkPath = path.join(UPLOAD_DIR, 'ambika-associate-crm.apk');
   const hasUploadedApk = fs.existsSync(hostedApkPath);
   const apkFileSize = hasUploadedApk ? fs.statSync(hostedApkPath).size : null;
 
+  const hostedAabPath = path.join(UPLOAD_DIR, 'ambika-associate-crm.aab');
+  const hasUploadedAab = fs.existsSync(hostedAabPath);
+  const aabFileSize = hasUploadedAab ? fs.statSync(hostedAabPath).size : null;
+
   return {
-    petrolRatePerKm: Number(map.petrolRatePerKm ?? 3.5),
+    petrolRatePerKm: Number(map.petrolRatePerKm ?? 3.0),
     assignmentSlaMinutes: Number(map.assignmentSlaMinutes ?? 10),
     followupSlaMinutes: Number(map.followupSlaMinutes ?? 10),
     enquirySlaMinutes: Number(map.enquirySlaMinutes ?? 60),
@@ -647,14 +921,30 @@ export function getSettings(): SystemSettings {
     hasUploadedApk,
     apkFileName: hasUploadedApk ? 'ambika-associate-crm.apk' : null,
     apkFileSize,
+    hasUploadedAab,
+    aabFileName: hasUploadedAab ? 'ambika-associate-crm.aab' : null,
+    aabFileSize,
     autoAssignIncomingLeads:
       map.autoAssignIncomingLeads === undefined ? true : Boolean(map.autoAssignIncomingLeads),
     autoAssignMaxActiveLeads: Math.max(1, Number(map.autoAssignMaxActiveLeads ?? 25)),
     autoAssignGeoWeight: Math.min(100, Math.max(0, Number(map.autoAssignGeoWeight ?? 60))),
+    officeName: String(map.officeName ?? 'AMBIKA ASSOCIATE Head Office'),
+    officeAddress: String(map.officeAddress ?? OFFICIAL_OFFICE_ADDRESS),
+    officeLatitude: Number(map.officeLatitude ?? 24.5819),
+    officeLongitude: Number(map.officeLongitude ?? 80.7921),
+    officeRadiusMeters: Math.max(50, Number(map.officeRadiusMeters ?? 500)),
+    attendanceCutoffTime: String(map.attendanceCutoffTime ?? '10:00'),
+    attendanceLatePenaltyInr: Math.max(0, Number(map.attendanceLatePenaltyInr ?? 20)),
+    unapprovedLeavePenaltyInr: Math.max(0, Number(map.unapprovedLeavePenaltyInr ?? 100)),
+    seniorityInstructions: String(map.seniorityInstructions ?? DEFAULT_SENIORITY_INSTRUCTIONS),
+    configVersion: Math.max(1, Number(map.configVersion ?? 1)),
+    appBuildVersion: APP_BUILD_VERSION,
+    lastSyncSummary: (map.lastSyncSummary as string | null) ?? null,
+    lastSyncUpdatedAt: (map.lastSyncUpdatedAt as string | null) ?? null,
   };
 }
 
-export function updateSetting(key: string, value: unknown, userId: number) {
+export function updateSetting(key: string, value: unknown, userId: number | null) {
   db.prepare(`
     INSERT INTO settings (key, value_json, updated_by, updated_at)
     VALUES (?, ?, ?, datetime('now'))
@@ -662,7 +952,32 @@ export function updateSetting(key: string, value: unknown, userId: number) {
       value_json = excluded.value_json,
       updated_by = excluded.updated_by,
       updated_at = datetime('now')
-  `).run(key, JSON.stringify(value), userId);
+  `).run(key, JSON.stringify(value), userId ?? null);
+}
+
+export function bumpConfigVersion(summary: string, userId?: number | null) {
+  const row = db.prepare(`SELECT value_json FROM settings WHERE key = 'configVersion'`).get() as
+    | { value_json: string }
+    | undefined;
+  let current = 1;
+  if (row) {
+    try {
+      current = Number(JSON.parse(row.value_json)) || 1;
+    } catch {
+      current = 1;
+    }
+  }
+  const nextVersion = current + 1;
+  const updatedAt = new Date().toISOString();
+  updateSetting('configVersion', nextVersion, userId ?? null);
+  updateSetting('lastSyncSummary', summary, userId ?? null);
+  updateSetting('lastSyncUpdatedAt', updatedAt, userId ?? null);
+  return {
+    configVersion: nextVersion,
+    appBuildVersion: APP_BUILD_VERSION,
+    summary,
+    updatedAt,
+  };
 }
 
 export function logAudit(
@@ -868,10 +1183,10 @@ export function seedVerificationDatasetInternal(initialBoot = false) {
   `).run(fo1.id, l1, isoAgo(140));
 
   db.prepare(`
-    INSERT INTO bike_runs (run_code, employee_id, start_time, end_time, start_lat, start_lng, end_lat, end_lng, opening_odometer, closing_odometer, gps_distance_km, odometer_distance_km, discrepancy_km, discrepancy_flag, rate_per_km, eligible_km, incentive_amount, approval_status, route_points_json, status)
-    VALUES (?, ?, ?, ?, 19.0760, 72.8777, 19.1364, 72.8296, 14250, 14268.4, 17.8, 18.4, 0.6, 0, 3.5, 17.8, 62.30, 'PENDING', ?, 'COMPLETED')
+    INSERT INTO bike_runs (run_code, employee_id, lead_id, customer_name, tour_reason, start_location, end_location, start_time, end_time, start_lat, start_lng, end_lat, end_lng, opening_odometer, closing_odometer, gps_distance_km, odometer_distance_km, discrepancy_km, discrepancy_flag, rate_per_km, eligible_km, gross_amount, deducted_amount, incentive_amount, approval_status, route_points_json, status)
+    VALUES (?, ?, ?, 'Ramesh Chandra Tiwari', 'Loan Agreement & KYC Document Pickup', 'Mumbai HQ (19.0760, 72.8777)', 'Andheri West (19.1364, 72.8296)', ?, ?, 19.0760, 72.8777, 19.1364, 72.8296, 14250, 14268.4, 17.8, 18.4, 0.6, 0, 3.0, 17.8, 53.40, 0, 53.40, 'PENDING', ?, 'COMPLETED')
   `).run(
-    'RUN-0001', fo1.id, isoAgo(210), isoAgo(145),
+    'RUN-0001', fo1.id, l1, isoAgo(210), isoAgo(145),
     JSON.stringify([
       { lat: 19.076, lng: 72.8777, ts: isoAgo(210) },
       { lat: 19.105, lng: 72.852, ts: isoAgo(175) },
@@ -920,7 +1235,7 @@ export function seedVerificationDatasetInternal(initialBoot = false) {
 
   if (!initialBoot) {
     logAudit(
-      { id: admin.id, fullName: 'Rajesh Sharma', role: 'SUPER_ADMIN' },
+      { id: admin.id, fullName: 'Ruchi Gupta', role: 'SUPER_ADMIN' },
       'SEED_VERIFICATION_DATA',
       'SYSTEM',
       null,
@@ -941,6 +1256,19 @@ export function seedSalesExtensionsIfNeeded() {
         VALUES ('LG001', 'Sneha Tiwari', '9800000009', 'sneha.lg@ambikaassociate.in', ?, 'LEAD_GENERATOR', ?, NULL, NULL, 1, 0, 1, 1)
       `).run(backofficeHash, b1.id);
     }
+  }
+
+  // Ensure Admin-requested Branch Manager account (TLPALAKGUPTA) exists cleanly if absent
+  const palakExists = db
+    .prepare(`SELECT id FROM users WHERE UPPER(REPLACE(employee_code, ' ', '')) = 'TLPALAKGUPTA'`)
+    .get();
+  if (!palakExists) {
+    const b1 = db.prepare(`SELECT id FROM branches ORDER BY id ASC LIMIT 1`).get() as { id: number } | undefined;
+    const palakHash = bcrypt.hashSync('palak123', 10);
+    db.prepare(`
+      INSERT OR IGNORE INTO users (employee_code, full_name, mobile, email, password_hash, role, branch_id, team_id, referral_code, is_active, otp_enabled, gps_consent, camera_consent)
+      VALUES ('TLPALAKGUPTA', 'Palak Gupta', '', 'tlpalakgupta@ambikaassociate.in', ?, 'BRANCH_MANAGER', ?, NULL, NULL, 1, 0, 1, 1)
+    `).run(palakHash, b1?.id ?? null);
   }
 
   const monthKey = new Date().toISOString().slice(0, 7);
@@ -1057,6 +1385,8 @@ export function seedSalesExtensionsIfNeeded() {
 export function clearTestData(adminUser: { id: number; fullName: string; role: UserRole }) {
   db.exec(`
     DELETE FROM staff_rewards;
+    DELETE FROM attendance_logs;
+    DELETE FROM leave_requests;
     DELETE FROM referral_payouts;
     DELETE FROM alerts;
     DELETE FROM audit_logs;

@@ -6,6 +6,7 @@ import {
   Bell,
   Bike,
   Calculator,
+  CalendarCheck2,
   Camera,
   ChevronRight,
   CloudOff,
@@ -25,6 +26,8 @@ import {
   Users,
   X,
   Download,
+  FileText,
+  Pencil,
 } from 'lucide-react';
 import type { AlertRecord, AuthUser, SystemSettings } from '../shared/types';
 import { apiFetch, getStoredToken, setStoredToken } from './lib/api';
@@ -54,6 +57,9 @@ import { QuickCameraModal } from './components/QuickCameraModal';
 import { AppInstallModal } from './components/AppInstallModal';
 import { MobileAppPromptBanner } from './components/MobileAppPromptBanner';
 import { ReferralConsoleModule } from './components/ReferralConsoleModule';
+import { LegalTermsModal, type LegalTab } from './components/LegalTermsModal';
+import { ProfileModal } from './components/ProfileModal';
+import { AttendanceLeaveModule } from './components/AttendanceLeaveModule';
 
 export interface NavEntry {
   tab: string;
@@ -103,29 +109,37 @@ export default function App() {
   const [unreadCount, setUnreadCount] = useState(0);
 
   const [settings, setSettings] = useState<SystemSettings>({
-    petrolRatePerKm: 3.5,
+    petrolRatePerKm: 3.0,
     assignmentSlaMinutes: 10,
     followupSlaMinutes: 10,
     enquirySlaMinutes: 60,
     otpRequiredGlobal: false,
     defaultLanguage: 'en',
     companyLogoDataUrl: null,
+    officeAddress: '1ST FLOR ANUPAM COMPLEX,PATERI ROAD,NEAR RELIANCE BAZAR,SATNA MP(485001)',
     referralBonusThreshold: 5,
     referralBonusPct: 0.15,
     loanProducts: [
       { id: 'home_loan', name: 'Home Loan', defaultRate: 8.65, minTenureMonths: 12, maxTenureMonths: 360, commissionPct: 0.45 },
-      { id: 'lap', name: 'Loan Against Property (LAP)', defaultRate: 9.75, minTenureMonths: 12, maxTenureMonths: 240, commissionPct: 0.55 },
-      { id: 'personal_loan', name: 'Personal Loan', defaultRate: 11.25, minTenureMonths: 12, maxTenureMonths: 72, commissionPct: 1.0 },
-      { id: 'business_loan', name: 'Business Loan', defaultRate: 14.5, minTenureMonths: 12, maxTenureMonths: 60, commissionPct: 1.15 },
+      { id: 'lap', name: 'Loan Against Property (LAP)', defaultRate: 9.75, minTenureMonths: 12, maxTenureMonths: 240, commissionPct: 0.65 },
+      { id: 'personal_loan', name: 'Personal Loan', defaultRate: 11.25, minTenureMonths: 12, maxTenureMonths: 72, commissionPct: 1.25 },
+      { id: 'business_loan', name: 'Business Loan', defaultRate: 14.5, minTenureMonths: 12, maxTenureMonths: 60, commissionPct: 1.5 },
+      { id: 'auto_loan', name: 'Auto / Commercial Vehicle Loan', defaultRate: 9.25, minTenureMonths: 12, maxTenureMonths: 84, commissionPct: 0.85 },
+      { id: 'gold_loan', name: 'Gold / Working Capital', defaultRate: 10.5, minTenureMonths: 3, maxTenureMonths: 36, commissionPct: 0.5 },
     ],
   });
 
   const isOnline = useOnlineStatus();
   const { isInstallable, isInstalled, isIOS, isAndroid, install } = usePWAInstall();
   const [showAppInstallModal, setShowAppInstallModal] = useState(false);
+  const [legalTab, setLegalTab] = useState<LegalTab | null>(null);
+  const [showProfileModal, setShowProfileModal] = useState(false);
   const [pendingOfflineCount, setPendingOfflineCount] = useState(0);
   const [syncingOffline, setSyncingOffline] = useState(false);
   const [syncBannerMsg, setSyncBannerMsg] = useState<string | null>(null);
+  const [todayAttendanceMarked, setTodayAttendanceMarked] = useState(false);
+  const configVersionRef = useRef<number>(0);
+  const buildVersionRef = useRef<string | null>(null);
 
   const fetchAlerts = async () => {
     if (!getStoredToken()) return;
@@ -138,13 +152,144 @@ export default function App() {
     }
   };
 
-  useEffect(() => {
-    const boot = async () => {
-      try {
+  const fetchTodayAttendanceStatus = async (role?: string) => {
+    if (!getStoredToken() || role === 'REFERRAL_PARTNER') {
+      setTodayAttendanceMarked(false);
+      return;
+    }
+    try {
+      const att = await apiFetch<{ todayRecord?: any }>('/attendance');
+      setTodayAttendanceMarked(Boolean(att.todayRecord));
+    } catch {
+      // ignore transient network errors
+    }
+  };
+
+  const applyRemoteConfigSync = async (summary?: string | null, silent = false) => {
+    try {
+      const token = getStoredToken();
+      if (token) {
+        const [sRes, meRes] = await Promise.all([
+          apiFetch<{ settings: SystemSettings }>('/admin/settings'),
+          apiFetch<{ user: AuthUser }>('/auth/me'),
+        ]);
+        setSettings(sRes.settings);
+        setUser(meRes.user);
+        if (typeof sRes.settings.configVersion === 'number') {
+          configVersionRef.current = sRes.settings.configVersion;
+        }
+        await Promise.all([fetchAlerts(), fetchTodayAttendanceStatus(meRes.user.role)]);
+      } else {
         const brand = await apiFetch<any>('/public/branding');
         setSettings((prev) => ({
           ...prev,
           companyLogoDataUrl: brand.companyLogoDataUrl ?? null,
+          officeAddress: brand.officeAddress ?? prev.officeAddress,
+          loanProducts: brand.loanProducts ?? prev.loanProducts,
+          seniorityInstructions: brand.seniorityInstructions ?? prev.seniorityInstructions,
+          configVersion: brand.configVersion ?? prev.configVersion,
+          appBuildVersion: brand.appBuildVersion ?? prev.appBuildVersion,
+          lastSyncSummary: brand.lastSyncSummary ?? prev.lastSyncSummary,
+          lastSyncUpdatedAt: brand.lastSyncUpdatedAt ?? prev.lastSyncUpdatedAt,
+        }));
+        if (typeof brand.configVersion === 'number') {
+          configVersionRef.current = brand.configVersion;
+        }
+      }
+
+      window.dispatchEvent(
+        new CustomEvent('ambika:live-sync', {
+          detail: { configVersion: configVersionRef.current, summary: summary || null },
+        })
+      );
+
+      if (!silent && summary) {
+        setSyncBannerMsg(`Admin update applied automatically: ${summary}`);
+      }
+    } catch {
+      // ignore transient offline errors
+    }
+  };
+
+  const applyRemoteBuildUpdate = async (remoteBuild: string) => {
+    try {
+      const appliedKey = 'ambika_applied_build_version';
+      const lastApplied = localStorage.getItem(appliedKey);
+      if (lastApplied === remoteBuild) return;
+      localStorage.setItem(appliedKey, remoteBuild);
+
+      if ('serviceWorker' in navigator) {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (reg?.active) {
+          reg.active.postMessage({ type: 'CLEAR_STALE_CACHES' });
+        }
+        await reg?.update().catch(() => {});
+        if (reg?.waiting) {
+          reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+        }
+      }
+      window.location.reload();
+    } catch {
+      // ignore storage errors
+    }
+  };
+
+  const checkLiveSyncVersion = async () => {
+    if (!navigator.onLine) return;
+    try {
+      const probe = await apiFetch<{
+        appBuildVersion?: string;
+        configVersion?: number;
+        lastSyncSummary?: string | null;
+      }>('/public/sync-version');
+
+      if (probe.appBuildVersion) {
+        if (!buildVersionRef.current) {
+          buildVersionRef.current = probe.appBuildVersion;
+          try {
+            localStorage.setItem('ambika_applied_build_version', probe.appBuildVersion);
+          } catch {
+            // ignore
+          }
+        } else if (probe.appBuildVersion !== buildVersionRef.current) {
+          buildVersionRef.current = probe.appBuildVersion;
+          await applyRemoteBuildUpdate(probe.appBuildVersion);
+          return;
+        }
+      }
+
+      if (typeof probe.configVersion === 'number') {
+        if (configVersionRef.current === 0) {
+          configVersionRef.current = probe.configVersion;
+        } else if (probe.configVersion > configVersionRef.current) {
+          configVersionRef.current = probe.configVersion;
+          await applyRemoteConfigSync(probe.lastSyncSummary || 'Latest Admin settings & seniority rules');
+        }
+      }
+    } catch {
+      // ignore transient network errors
+    }
+  };
+
+  useEffect(() => {
+    const boot = async () => {
+      try {
+        const brand = await apiFetch<any>('/public/branding');
+        if (typeof brand.configVersion === 'number') {
+          configVersionRef.current = brand.configVersion;
+        }
+        if (brand.appBuildVersion) {
+          buildVersionRef.current = brand.appBuildVersion;
+          try {
+            localStorage.setItem('ambika_applied_build_version', brand.appBuildVersion);
+          } catch {
+            // ignore
+          }
+        }
+        setSettings((prev) => ({
+          ...prev,
+          companyLogoDataUrl: brand.companyLogoDataUrl ?? null,
+          officeAddress: brand.officeAddress ?? prev.officeAddress,
           loanProducts: brand.loanProducts ?? prev.loanProducts,
           defaultLanguage: brand.defaultLanguage ?? 'en',
           playStoreUrl: brand.playStoreUrl ?? null,
@@ -152,6 +297,14 @@ export default function App() {
           hasUploadedApk: brand.hasUploadedApk ?? false,
           apkFileName: brand.apkFileName ?? null,
           apkFileSize: brand.apkFileSize ?? null,
+          hasUploadedAab: brand.hasUploadedAab ?? false,
+          aabFileName: brand.aabFileName ?? null,
+          aabFileSize: brand.aabFileSize ?? null,
+          seniorityInstructions: brand.seniorityInstructions ?? prev.seniorityInstructions,
+          configVersion: brand.configVersion ?? prev.configVersion,
+          appBuildVersion: brand.appBuildVersion ?? prev.appBuildVersion,
+          lastSyncSummary: brand.lastSyncSummary ?? prev.lastSyncSummary,
+          lastSyncUpdatedAt: brand.lastSyncUpdatedAt ?? prev.lastSyncUpdatedAt,
         }));
 
         if (getStoredToken()) {
@@ -160,7 +313,10 @@ export default function App() {
           setLang(me.user.preferredLang);
           const sRes = await apiFetch<{ settings: SystemSettings }>('/admin/settings');
           setSettings(sRes.settings);
-          await fetchAlerts();
+          if (typeof sRes.settings.configVersion === 'number') {
+            configVersionRef.current = sRes.settings.configVersion;
+          }
+          await Promise.all([fetchAlerts(), fetchTodayAttendanceStatus(me.user.role)]);
         }
       } catch {
         setStoredToken(null);
@@ -171,6 +327,76 @@ export default function App() {
     };
     boot();
   }, []);
+
+  // Real-time SSE connection + resume/polling fallback connecting all downloaded role apps to Admin Panel updates
+  useEffect(() => {
+    const handleResumeCheck = () => {
+      if (document.visibilityState === 'visible') {
+        void checkLiveSyncVersion();
+      }
+    };
+    const handleImmediateCheck = () => {
+      void checkLiveSyncVersion();
+    };
+
+    const pollTimer = window.setInterval(checkLiveSyncVersion, 15000);
+    document.addEventListener('visibilitychange', handleResumeCheck);
+    window.addEventListener('focus', handleImmediateCheck);
+    window.addEventListener('online', handleImmediateCheck);
+    window.addEventListener('ambika-app-resume', handleImmediateCheck);
+
+    let es: EventSource | null = null;
+    const token = getStoredToken();
+    if (user && token && typeof EventSource !== 'undefined') {
+      es = new EventSource(`/api/live-sync?token=${encodeURIComponent(token)}`);
+      es.addEventListener('connected', (event: MessageEvent) => {
+        try {
+          const payload = JSON.parse(event.data || '{}');
+          if (payload.appBuildVersion && buildVersionRef.current && payload.appBuildVersion !== buildVersionRef.current) {
+            void applyRemoteBuildUpdate(payload.appBuildVersion);
+            return;
+          }
+          if (typeof payload.configVersion === 'number' && payload.configVersion > configVersionRef.current) {
+            configVersionRef.current = payload.configVersion;
+            void applyRemoteConfigSync(payload.lastSyncSummary || 'Admin settings updated');
+          }
+        } catch {
+          // ignore malformed event
+        }
+      });
+      es.addEventListener('sync', (event: MessageEvent) => {
+        try {
+          const payload = JSON.parse(event.data || '{}');
+          if (typeof payload.configVersion === 'number') {
+            configVersionRef.current = payload.configVersion;
+          }
+          void applyRemoteConfigSync(payload.summary || 'Admin update synced');
+        } catch {
+          void applyRemoteConfigSync('Admin update synced');
+        }
+      });
+      es.addEventListener('attendance', (event: MessageEvent) => {
+        try {
+          const payload = JSON.parse(event.data || '{}');
+          if (payload.employeeId === user.id) {
+            setTodayAttendanceMarked(true);
+          }
+          window.dispatchEvent(new CustomEvent('ambika:live-sync', { detail: { scope: 'ATTENDANCE' } }));
+        } catch {
+          // ignore
+        }
+      });
+    }
+
+    return () => {
+      window.clearInterval(pollTimer);
+      document.removeEventListener('visibilitychange', handleResumeCheck);
+      window.removeEventListener('focus', handleImmediateCheck);
+      window.removeEventListener('online', handleImmediateCheck);
+      window.removeEventListener('ambika-app-resume', handleImmediateCheck);
+      es?.close();
+    };
+  }, [user?.id]);
 
   useEffect(() => {
     if (!user) return;
@@ -322,10 +548,13 @@ export default function App() {
     try {
       const sRes = await apiFetch<{ settings: SystemSettings }>('/admin/settings');
       setSettings(sRes.settings);
+      if (typeof sRes.settings.configVersion === 'number') {
+        configVersionRef.current = sRes.settings.configVersion;
+      }
     } catch {
       // use public branding fallback
     }
-    await fetchAlerts();
+    await Promise.all([fetchAlerts(), fetchTodayAttendanceStatus(authedUser.role)]);
   };
 
   const handleToggleLang = async () => {
@@ -385,6 +614,8 @@ export default function App() {
         apkDownloadUrl={settings.apkDownloadUrl}
         hasUploadedApk={settings.hasUploadedApk}
         apkFileSize={settings.apkFileSize}
+        hasUploadedAab={settings.hasUploadedAab}
+        aabFileSize={settings.aabFileSize}
         lang={lang}
         onToggleLang={handleToggleLang}
         onAuthenticated={handleAuthenticated}
@@ -396,6 +627,12 @@ export default function App() {
   const isSuperAdmin = user.role === 'SUPER_ADMIN';
   const isManager = ['SUPER_ADMIN', 'BRANCH_MANAGER', 'TEAM_LEADER'].includes(user.role);
   const canAccessReferralConsole = ['SUPER_ADMIN', 'LEAD_GENERATOR', 'FIELD_OFFICER'].includes(user.role);
+  const userInitials = (user.fullName || 'AA')
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((p) => p[0]?.toUpperCase())
+    .join('');
 
   const navItems = [
     { id: 'dashboard', label: t(lang, 'navDashboard'), icon: LayoutDashboard, visible: true },
@@ -412,6 +649,7 @@ export default function App() {
     { id: 'penalties', label: t(lang, 'navPenalties'), icon: ShieldAlert, visible: !isReferral },
     { id: 'enquiries', label: t(lang, 'navEnquiries'), icon: HelpCircle, visible: true },
     { id: 'field-ops', label: t(lang, 'navFieldOps'), icon: Bike, visible: !isReferral },
+    { id: 'attendance', label: t(lang, 'navAttendance'), icon: CalendarCheck2, visible: !isReferral },
     { id: 'alerts', label: t(lang, 'navAlerts'), icon: Bell, visible: true },
     { id: 'calculator', label: t(lang, 'navCalculator'), icon: Calculator, visible: true },
     { id: 'reports', label: t(lang, 'navReports'), icon: FileBarChart2, visible: true },
@@ -492,6 +730,8 @@ export default function App() {
       gps: 'GPS Location & Visits',
       timeline: 'Check-In / Out Timeline',
       bike: 'Bike Run & Petrol',
+      attendance: 'Daily Self Attendance',
+      leave: 'Leave & Seniority Approval',
       users: 'Users & Roles',
       rules: 'Rules & Branding',
       org: 'Branches & Teams',
@@ -512,7 +752,7 @@ export default function App() {
       {/* Desktop Sidebar */}
       <aside className="hidden lg:flex lg:w-64 lg:flex-col bg-[#0F2744] text-white shrink-0 border-r border-white/10">
         <div className="px-5 py-4 border-b border-white/10">
-          <BrandMark logoDataUrl={settings.companyLogoDataUrl} darkSurface />
+          <BrandMark logoDataUrl={settings.companyLogoDataUrl} cacheKey={settings.configVersion} darkSurface />
         </div>
 
         {/* Back / Forward Navigation Controls inside Sidebar Menu */}
@@ -590,12 +830,37 @@ export default function App() {
               {t(lang, 'downloadApp')}
             </button>
           )}
-          <div className="text-xs">
-            <div className="font-semibold text-white truncate">{user.fullName}</div>
-            <div className="text-slate-300 text-[11px] font-mono truncate">
-              {user.employeeCode} · {user.role.replace('_', ' ')}
+          <button
+            type="button"
+            onClick={() => setShowProfileModal(true)}
+            className="w-full flex items-center gap-2.5 p-2 rounded-xl bg-white/10 hover:bg-white/15 transition-colors text-left"
+          >
+            <div className="w-9 h-9 rounded-full overflow-hidden bg-[#EA580C] text-white flex items-center justify-center text-xs font-bold shrink-0 border border-white/20">
+              {user.profilePhotoDataUrl ? (
+                <img src={user.profilePhotoDataUrl} alt={user.fullName} className="w-full h-full object-cover" />
+              ) : (
+                <span>{userInitials}</span>
+              )}
             </div>
-          </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-xs font-semibold text-white truncate">{user.fullName}</div>
+              <div className="text-slate-300 text-[10px] font-mono truncate">
+                {user.employeeCode} · {user.role.replace('_', ' ')}
+              </div>
+              <div className="text-[10px] font-semibold text-yellow-300 mt-0.5 inline-flex items-center gap-1">
+                <Pencil className="w-2.5 h-2.5" />
+                {lang === 'hi' ? 'प्रोफ़ाइल संपादित करें' : 'Edit Profile'}
+              </div>
+            </div>
+          </button>
+          <button
+            type="button"
+            onClick={() => setLegalTab('terms')}
+            className="w-full flex items-center justify-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-[11px] font-medium text-slate-200 transition-colors"
+          >
+            <FileText className="w-3.5 h-3.5" />
+            {lang === 'hi' ? 'नियम व गोपनीयता नीति' : 'Terms & Privacy Policy'}
+          </button>
           <button
             type="button"
             onClick={handleLogout}
@@ -613,7 +878,7 @@ export default function App() {
           <div className="fixed inset-0 bg-black/50" onClick={() => setMobileMenuOpen(false)} />
           <aside className="relative w-72 max-w-[85vw] bg-[#0F2744] text-white flex flex-col h-full z-10">
             <div className="px-4 py-4 border-b border-white/10 flex items-center justify-between">
-              <BrandMark logoDataUrl={settings.companyLogoDataUrl} darkSurface />
+              <BrandMark logoDataUrl={settings.companyLogoDataUrl} cacheKey={settings.configVersion} darkSurface />
               <button type="button" onClick={() => setMobileMenuOpen(false)} className="p-1 text-slate-300">
                 <X className="w-5 h-5" />
               </button>
@@ -685,6 +950,40 @@ export default function App() {
                   {t(lang, 'downloadApp')}
                 </button>
               )}
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  setShowProfileModal(true);
+                }}
+                className="w-full flex items-center gap-2.5 p-2 rounded-xl bg-white/10 hover:bg-white/15 text-left"
+              >
+                <div className="w-9 h-9 rounded-full overflow-hidden bg-[#EA580C] text-white flex items-center justify-center text-xs font-bold shrink-0 border border-white/20">
+                  {user.profilePhotoDataUrl ? (
+                    <img src={user.profilePhotoDataUrl} alt={user.fullName} className="w-full h-full object-cover" />
+                  ) : (
+                    <span>{userInitials}</span>
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-semibold text-white truncate">{user.fullName}</div>
+                  <div className="text-[10px] font-semibold text-yellow-300 inline-flex items-center gap-1">
+                    <Pencil className="w-2.5 h-2.5" />
+                    {lang === 'hi' ? 'मेरी प्रोफ़ाइल संपादित करें' : 'Edit Profile / Photo'}
+                  </div>
+                </div>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  setLegalTab('terms');
+                }}
+                className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg bg-white/5 text-xs font-medium text-slate-200"
+              >
+                <FileText className="w-3.5 h-3.5" />
+                {lang === 'hi' ? 'नियम व गोपनीयता नीति' : 'Terms & Privacy Policy'}
+              </button>
               <button
                 type="button"
                 onClick={handleLogout}
@@ -777,6 +1076,35 @@ export default function App() {
               {lang === 'en' ? 'हिंदी' : 'EN'}
             </button>
 
+            {!isReferral && (
+              <button
+                type="button"
+                onClick={() => navigateTo('attendance', null, 'attendance')}
+                aria-label="Open Daily Attendance"
+                title={
+                  todayAttendanceMarked
+                    ? 'Today Attendance Marked — View Register & Leave'
+                    : 'Mark Daily Attendance inside Ambika Office GPS'
+                }
+                className={`inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-2 rounded-lg text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
+                  todayAttendanceMarked
+                    ? 'bg-green-50 border border-green-300 text-[#15803D] hover:bg-green-100'
+                    : 'bg-[#15803D] hover:bg-green-800 text-white'
+                }`}
+              >
+                <CalendarCheck2 className="w-4 h-4 shrink-0" />
+                <span>
+                  {todayAttendanceMarked
+                    ? lang === 'hi'
+                      ? 'हाज़िरी ✓'
+                      : 'Marked'
+                    : lang === 'hi'
+                    ? 'हाज़िरी'
+                    : 'Attendance'}
+                </span>
+              </button>
+            )}
+
             {/* TOP HEADER CAMERA ICON BESIDE BELL ICON: Launches full camera studio immediately */}
             <button
               type="button"
@@ -787,6 +1115,22 @@ export default function App() {
             >
               <Camera className="w-4 h-4 text-[#EA580C]" />
               <span className="hidden sm:inline">{lang === 'hi' ? 'कैमरा' : 'Camera'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowProfileModal(true)}
+              title={lang === 'hi' ? 'प्रोफ़ाइल संपादित करें' : 'Edit Profile (Photo, Name, Mobile, Email)'}
+              className="inline-flex items-center gap-2 pl-1.5 pr-2.5 py-1 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-[#0F2744] whitespace-nowrap shrink-0"
+            >
+              <span className="w-6 h-6 rounded-full overflow-hidden bg-[#0F2744] text-white flex items-center justify-center text-[10px] font-bold shrink-0">
+                {user.profilePhotoDataUrl ? (
+                  <img src={user.profilePhotoDataUrl} alt={user.fullName} className="w-full h-full object-cover" />
+                ) : (
+                  <span>{userInitials}</span>
+                )}
+              </span>
+              <span className="hidden sm:inline max-w-[120px] truncate">{user.fullName}</span>
             </button>
 
             {/* TOP HEADER BELL ICON: Red with unread count when > 0, Green when 0 */}
@@ -1011,6 +1355,15 @@ export default function App() {
               onAlertsChanged={fetchAlerts}
             />
           )}
+          {activeTab === 'attendance' && !isReferral && (
+            <AttendanceLeaveModule
+              user={user}
+              activeOption={activeSubOption as any}
+              onSelectOption={(opt) => selectSubOption(opt)}
+              onAlertsChanged={fetchAlerts}
+              onAttendanceMarked={() => setTodayAttendanceMarked(true)}
+            />
+          )}
           {activeTab === 'alerts' && (
             <AlertCentreView
               alerts={alerts}
@@ -1027,6 +1380,7 @@ export default function App() {
           {activeTab === 'calculator' && (
             <CalculatorModule
               loanProducts={settings.loanProducts}
+              userRole={user.role}
               lang={lang}
               activeOption={activeSubOption}
               onSelectOption={(opt) => selectSubOption(opt)}
@@ -1095,13 +1449,17 @@ export default function App() {
 
         <button
           type="button"
-          onClick={() => navigateTo(isReferral ? 'enquiries' : 'field-ops')}
+          onClick={() => navigateTo(isReferral ? 'enquiries' : 'attendance', null, isReferral ? null : 'attendance')}
           className={`flex flex-col items-center justify-center gap-0.5 py-1 rounded-lg text-[10px] font-semibold ${
-            activeTab === (isReferral ? 'enquiries' : 'field-ops') ? 'text-[#EA580C]' : 'text-slate-500'
+            activeTab === (isReferral ? 'enquiries' : 'attendance')
+              ? 'text-[#EA580C]'
+              : !isReferral && todayAttendanceMarked
+              ? 'text-[#15803D]'
+              : 'text-slate-600'
           }`}
         >
-          {isReferral ? <HelpCircle className="w-4 h-4" /> : <Bike className="w-4 h-4" />}
-          <span>{isReferral ? 'Enquiry' : 'Field Ops'}</span>
+          {isReferral ? <HelpCircle className="w-4 h-4" /> : <CalendarCheck2 className="w-4 h-4" />}
+          <span>{isReferral ? 'Enquiry' : todayAttendanceMarked ? 'Marked ✓' : 'Attendance'}</span>
         </button>
 
         <button
@@ -1128,7 +1486,30 @@ export default function App() {
           apkDownloadUrl={settings.apkDownloadUrl}
           hasUploadedApk={settings.hasUploadedApk}
           apkFileSize={settings.apkFileSize}
+          hasUploadedAab={settings.hasUploadedAab}
+          aabFileSize={settings.aabFileSize}
           onClose={() => setShowAppInstallModal(false)}
+        />
+      )}
+
+      {legalTab && (
+        <LegalTermsModal
+          lang={lang}
+          initialTab={legalTab}
+          onClose={() => setLegalTab(null)}
+        />
+      )}
+
+      {showProfileModal && (
+        <ProfileModal
+          user={user}
+          lang={lang}
+          officeAddress={settings.officeAddress}
+          onProfileUpdated={(updated) => setUser(updated)}
+          onOfficeAddressUpdated={(nextAddress) =>
+            setSettings((prev) => ({ ...prev, officeAddress: nextAddress }))
+          }
+          onClose={() => setShowProfileModal(false)}
         />
       )}
 

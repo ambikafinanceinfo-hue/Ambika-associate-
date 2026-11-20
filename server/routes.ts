@@ -17,6 +17,8 @@ import {
 } from '../shared/types.ts';
 import { decryptPii, encryptPii, generateSessionToken, hashLookup } from './crypto.ts';
 import {
+  APP_BUILD_VERSION,
+  bumpConfigVersion,
   clearTestData,
   createAlert,
   db,
@@ -34,6 +36,38 @@ import { processSlaTimers, purgeExpiredFollowupRecordings } from './slaEngine.ts
 interface AuthedRequest extends Request {
   user?: AuthUser;
   sessionToken?: string;
+}
+
+interface LiveSyncClient {
+  res: Response;
+  userId: number;
+  role: UserRole;
+}
+
+const liveSyncClients = new Set<LiveSyncClient>();
+
+function pushSseEvent(eventName: string, payload: Record<string, any>) {
+  const frame = `event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const client of Array.from(liveSyncClients)) {
+    try {
+      client.res.write(frame);
+    } catch {
+      liveSyncClients.delete(client);
+    }
+  }
+}
+
+function broadcastLiveSync(scope: string, summary: string, actor?: AuthUser | null) {
+  const { configVersion, updatedAt } = bumpConfigVersion(summary, actor?.id ?? null);
+  pushSseEvent('sync', {
+    scope,
+    summary,
+    configVersion,
+    appBuildVersion: APP_BUILD_VERSION,
+    updatedAt,
+    updatedBy: actor?.fullName || 'Super Admin',
+    updatedByRole: actor?.role || 'SUPER_ADMIN',
+  });
 }
 
 function nowSql(offsetMinutes = 0): string {
@@ -87,6 +121,7 @@ function loadUserById(userId: number): AuthUser | null {
     gpsConsent: Boolean(row.gps_consent),
     cameraConsent: Boolean(row.camera_consent),
     preferredLang: row.preferred_lang === 'hi' ? 'hi' : 'en',
+    profilePhotoDataUrl: row.profile_photo_data_url ?? null,
   };
 }
 
@@ -130,6 +165,42 @@ function requireRoles(...allowed: UserRole[]) {
   };
 }
 
+function resolveLeadClosureSeniority(row: any): {
+  actorRole: UserRole;
+  expectedApproverRole: 'TEAM_LEADER' | 'BRANCH_MANAGER' | 'SUPER_ADMIN';
+  expectedApproverLabel: string;
+} {
+  const actorRole: UserRole =
+    (row.rejected_by_role as UserRole) ||
+    (row.assigned_officer_id
+      ? 'FIELD_OFFICER'
+      : row.assigned_tl_id
+        ? 'TEAM_LEADER'
+        : row.assigned_bm_id
+          ? 'BRANCH_MANAGER'
+          : (row.created_by_role as UserRole) || 'BRANCH_MANAGER');
+
+  if (actorRole === 'FIELD_OFFICER') {
+    return {
+      actorRole,
+      expectedApproverRole: 'TEAM_LEADER',
+      expectedApproverLabel: 'Team Leader (TL)',
+    };
+  }
+  if (actorRole === 'TEAM_LEADER' || actorRole === 'LEAD_GENERATOR') {
+    return {
+      actorRole,
+      expectedApproverRole: 'BRANCH_MANAGER',
+      expectedApproverLabel: 'Branch Manager (BM)',
+    };
+  }
+  return {
+    actorRole,
+    expectedApproverRole: 'SUPER_ADMIN',
+    expectedApproverLabel: 'Super Admin',
+  };
+}
+
 function serializeLeadForUser(row: any, user: AuthUser): LeadRecord {
   const isReferral = user.role === 'REFERRAL_PARTNER';
   if (isReferral) {
@@ -166,6 +237,22 @@ function serializeLeadForUser(row: any, user: AuthUser): LeadRecord {
       branchName: row.branch_name ?? null,
       status: row.status as CaseStatus,
       lostReason: null,
+      rejectedBy: null,
+      rejectedByName: null,
+      rejectedByCode: null,
+      rejectedByRole: null,
+      rejectedAt: null,
+      closureStatus: null,
+      closureRequestedBy: null,
+      closureRequestedByName: null,
+      closureRequestedAt: null,
+      closureApprovedBy: null,
+      closureApprovedByName: null,
+      closureApprovedAt: null,
+      closureRemarks: null,
+      expectedClosureApproverRole: null,
+      expectedClosureApproverLabel: null,
+      canApproveClosure: false,
       existingEmi: null,
       employmentType: null,
       lastStatusAt: row.last_status_at,
@@ -176,6 +263,16 @@ function serializeLeadForUser(row: any, user: AuthUser): LeadRecord {
       redactedForReferral: true,
     };
   }
+
+  const closureSeniority = resolveLeadClosureSeniority(row);
+  const effectiveClosureStatus =
+    (row.closure_status as LeadRecord['closureStatus']) ||
+    (row.status === 'Rejected' ? 'PENDING_APPROVAL' : row.status === 'Closed' ? 'APPROVED' : 'NONE');
+  const canApproveClosure =
+    row.status === 'Rejected' &&
+    effectiveClosureStatus === 'PENDING_APPROVAL' &&
+    user.role === closureSeniority.expectedApproverRole &&
+    canUserAccessLead(row, user);
 
   return {
     id: row.id,
@@ -216,6 +313,24 @@ function serializeLeadForUser(row: any, user: AuthUser): LeadRecord {
     branchName: row.branch_name ?? null,
     status: row.status as CaseStatus,
     lostReason: row.lost_reason ?? null,
+    rejectedBy: row.rejected_by ?? null,
+    rejectedByName: row.rejected_by_name ?? null,
+    rejectedByCode: row.rejected_by_code ?? null,
+    rejectedByRole: (row.rejected_by_role as UserRole) ?? null,
+    rejectedAt: row.rejected_at ?? null,
+    closureStatus: effectiveClosureStatus,
+    closureRequestedBy: row.closure_requested_by ?? null,
+    closureRequestedByName: row.closure_requested_by_name ?? null,
+    closureRequestedAt: row.closure_requested_at ?? null,
+    closureApprovedBy: row.closure_approved_by ?? null,
+    closureApprovedByName: row.closure_approved_by_name ?? null,
+    closureApprovedAt: row.closure_approved_at ?? null,
+    closureRemarks: row.closure_remarks ?? null,
+    expectedClosureApproverRole:
+      row.status === 'Rejected' || effectiveClosureStatus !== 'NONE' ? closureSeniority.expectedApproverRole : null,
+    expectedClosureApproverLabel:
+      row.status === 'Rejected' || effectiveClosureStatus !== 'NONE' ? closureSeniority.expectedApproverLabel : null,
+    canApproveClosure,
     existingEmi: row.existing_emi !== undefined && row.existing_emi !== null ? Number(row.existing_emi) : 0,
     employmentType: row.employment_type ?? 'Salaried',
     lastStatusAt: row.last_status_at ?? null,
@@ -619,6 +734,7 @@ export function createApiRouter() {
         'APK',
         `Uploaded signed Android APK (${Math.round(buf.length / 1024)} KB) for direct download`
       );
+      broadcastLiveSync('APP_BINARY_UPDATED', 'New Android APK build uploaded by Admin', req.user!);
       res.json({ ok: true, settings: getSettings() });
     }
   );
@@ -632,14 +748,54 @@ export function createApiRouter() {
     res.json({ ok: true, settings: getSettings() });
   });
 
+  // Raw Binary Play Store AAB Upload / Delete (Super Admin Only — mounted BEFORE express.json)
+  router.post(
+    '/admin/upload-aab',
+    requireAuth,
+    requireRoles('SUPER_ADMIN'),
+    express.raw({ type: ['application/octet-stream', 'application/x-authorware-bin'], limit: '100mb' }),
+    (req: AuthedRequest, res) => {
+      const buf = req.body as Buffer;
+      if (!Buffer.isBuffer(buf) || buf.length < 100) {
+        res.status(400).json({ error: 'Valid Android App Bundle (.aab) file is required' });
+        return;
+      }
+      if (buf[0] !== 0x50 || buf[1] !== 0x4b) {
+        res.status(400).json({ error: 'Invalid AAB bundle format (missing ZIP PK header)' });
+        return;
+      }
+      const aabPath = path.join(UPLOADS_PATH, 'ambika-associate-crm.aab');
+      fs.writeFileSync(aabPath, buf);
+      logAudit(
+        req.user!,
+        'ANDROID_AAB_UPLOADED',
+        'SETTINGS',
+        'AAB',
+        `Uploaded signed Play Store AAB (${Math.round(buf.length / 1024)} KB)`
+      );
+      broadcastLiveSync('APP_BINARY_UPDATED', 'New Play Store AAB build uploaded by Admin', req.user!);
+      res.json({ ok: true, settings: getSettings() });
+    }
+  );
+
+  router.delete('/admin/upload-aab', requireAuth, requireRoles('SUPER_ADMIN'), (req: AuthedRequest, res) => {
+    const aabPath = path.join(UPLOADS_PATH, 'ambika-associate-crm.aab');
+    if (fs.existsSync(aabPath)) {
+      fs.unlinkSync(aabPath);
+      logAudit(req.user!, 'ANDROID_AAB_REMOVED', 'SETTINGS', 'AAB', 'Removed hosted Play Store AAB file');
+    }
+    res.json({ ok: true, settings: getSettings() });
+  });
+
   router.use(express.json({ limit: '20mb' }));
 
-  // Public health & branding settings (logo + default language + app download links for login screen)
+  // Public health & branding settings (logo + default language + app download links + live sync metadata)
   router.get('/public/branding', (_req, res) => {
     const settings = getSettings();
     res.json({
       companyName: 'AMBIKA ASSOCIATE',
       tagline: 'SMART FINANCE SMART SAVING',
+      officeAddress: settings.officeAddress,
       companyLogoDataUrl: settings.companyLogoDataUrl,
       defaultLanguage: settings.defaultLanguage,
       otpRequiredGlobal: settings.otpRequiredGlobal,
@@ -649,6 +805,66 @@ export function createApiRouter() {
       hasUploadedApk: settings.hasUploadedApk ?? false,
       apkFileName: settings.apkFileName ?? null,
       apkFileSize: settings.apkFileSize ?? null,
+      hasUploadedAab: settings.hasUploadedAab ?? false,
+      aabFileName: settings.aabFileName ?? null,
+      aabFileSize: settings.aabFileSize ?? null,
+      seniorityInstructions: settings.seniorityInstructions,
+      configVersion: settings.configVersion,
+      appBuildVersion: settings.appBuildVersion,
+      lastSyncSummary: settings.lastSyncSummary,
+      lastSyncUpdatedAt: settings.lastSyncUpdatedAt,
+    });
+  });
+
+  // Lightweight live sync version probe (used by downloaded mobile & desktop apps on resume/poll)
+  router.get('/public/sync-version', (_req, res) => {
+    const settings = getSettings();
+    res.json({
+      appBuildVersion: APP_BUILD_VERSION,
+      configVersion: settings.configVersion,
+      lastSyncSummary: settings.lastSyncSummary,
+      lastSyncUpdatedAt: settings.lastSyncUpdatedAt,
+      companyLogoDataUrl: settings.companyLogoDataUrl,
+      officeAddress: settings.officeAddress,
+      seniorityInstructions: settings.seniorityInstructions,
+    });
+  });
+
+  // Real-time Server-Sent Events stream connecting all downloaded BM/TL/Back Office/Field Officer apps
+  router.get('/live-sync', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-store, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    const client: LiveSyncClient = { res, userId: user.id, role: user.role };
+    liveSyncClients.add(client);
+
+    const settings = getSettings();
+    res.write(
+      `event: connected\ndata: ${JSON.stringify({
+        configVersion: settings.configVersion,
+        appBuildVersion: APP_BUILD_VERSION,
+        lastSyncSummary: settings.lastSyncSummary,
+        lastSyncUpdatedAt: settings.lastSyncUpdatedAt,
+        role: user.role,
+      })}\n\n`
+    );
+
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(`: keepalive ${Date.now()}\n\n`);
+      } catch {
+        clearInterval(heartbeat);
+        liveSyncClients.delete(client);
+      }
+    }, 25000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      liveSyncClients.delete(client);
     });
   });
 
@@ -660,6 +876,7 @@ export function createApiRouter() {
     }
 
     const liveOrigin = resolvePublicOrigin(req);
+    const escapedOrigin = liveOrigin.replace(/"/g, '\\"');
     const tmpParent = fs.mkdtempSync(path.join(UPLOADS_PATH, 'kit-'));
     const stagedDir = path.join(tmpParent, 'android-app');
     fs.cpSync(androidDir, stagedDir, { recursive: true });
@@ -668,22 +885,39 @@ export function createApiRouter() {
     if (fs.existsSync(gradleFile)) {
       const original = fs.readFileSync(gradleFile, 'utf-8');
       const patched = original.replace(
-        'https://your-production-domain.example',
-        liveOrigin.replace(/"/g, '\\"')
+        /("CRM_BASE_URL",\s*\r?\n?\s*)"\\"https?:\/\/[^"]+\\""/,
+        `$1"\\"${escapedOrigin}\\""`
       );
       fs.writeFileSync(gradleFile, patched, 'utf-8');
+    }
+
+    const checklistFile = path.join(stagedDir, 'PLAY_STORE_CHECKLIST.md');
+    if (fs.existsSync(checklistFile)) {
+      const checklistOriginal = fs.readFileSync(checklistFile, 'utf-8');
+      fs.writeFileSync(
+        checklistFile,
+        checklistOriginal.replace(
+          /https:\/\/ais-pre-[^/]+/g,
+          liveOrigin
+        ),
+        'utf-8'
+      );
     }
 
     fs.writeFileSync(
       path.join(stagedDir, 'BUILD_APK_INSTRUCTIONS.txt'),
       [
-        'AMBIKA ASSOCIATE CRM — Android APK Build Instructions',
+        'AMBIKA ASSOCIATE CRM — Google Play Store (.aab) & Direct APK Build Instructions',
         `Configured CRM Server URL: ${liveOrigin}`,
+        `Play Store Privacy Policy URL: ${liveOrigin}/privacy-policy`,
+        `Play Store Terms & Conditions URL: ${liveOrigin}/terms-and-conditions`,
+        `Play Store Account Deletion URL: ${liveOrigin}/account-deletion`,
         '',
-        '1. Open this android-app folder in Android Studio (Koala or newer), OR run Gradle with Android SDK installed.',
-        '2. Build Debug APK:   ./gradlew assembleDebug   (outputs app/build/outputs/apk/debug/app-debug.apk)',
-        '3. Build Signed APK:  Build -> Generate Signed Bundle / APK -> APK',
-        '4. Optional: Upload the compiled .apk in CRM Admin Settings -> Rules & Branding -> Upload Signed APK',
+        '1. Open this android-app folder in Android Studio (Koala or newer), OR push to GitHub to run .github/workflows/build-android.yml.',
+        '2. Build Debug APK:      ./gradlew assembleDebug    -> app/build/outputs/apk/debug/app-debug.apk',
+        '3. Build Release APK:    ./gradlew assembleRelease  -> app/build/outputs/apk/release/app-release.apk',
+        '4. Build Play Store AAB: ./gradlew bundleRelease    -> app/build/outputs/bundle/release/app-release.aab',
+        '5. Upload the compiled .apk in CRM Admin Settings -> Rules & Branding -> Upload Signed APK',
         '   so staff clicking "Download APK" install the compiled APK directly with one tap!',
       ].join('\n'),
       'utf-8'
@@ -738,8 +972,20 @@ export function createApiRouter() {
     streamPatchedAndroidKit(req, res);
   });
 
-  // Downloadable Android Studio Kotlin + Launcher Icon APK/Play Store Build Kit (live origin injected)
+  // Downloadable Android Studio Kotlin + Play Store AAB/APK Build Kit (live origin injected)
   router.get('/public/android-app-kit', streamPatchedAndroidKit);
+
+  // Download Play Store .aab bundle (if uploaded by Admin), otherwise streams Play Store Build Kit
+  router.get('/public/download-aab', (req, res) => {
+    const aabPath = path.join(UPLOADS_PATH, 'ambika-associate-crm.aab');
+    if (fs.existsSync(aabPath)) {
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Disposition', 'attachment; filename="ambika-associate-crm.aab"');
+      fs.createReadStream(aabPath).pipe(res);
+      return;
+    }
+    streamPatchedAndroidKit(req, res);
+  });
 
   // Apple iOS / iPhone / iPod Touch / iPad Full-Screen WebClip Profile (.mobileconfig)
   router.get('/public/ios-app-profile', (req, res) => {
@@ -1021,24 +1267,57 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
   // Authentication
   router.post('/auth/login', (req, res) => {
     const { identifier, password } = req.body as { identifier?: string; password?: string };
-    if (!identifier || !password) {
+    const cleanId = String(identifier || '').trim();
+    const compactId = cleanId.replace(/\s+/g, '');
+    const rawPass = String(password ?? '');
+    const trimmedPass = rawPass.trim();
+
+    if (!cleanId || !trimmedPass) {
       res.status(400).json({ error: 'Employee Code / Mobile and Password are required' });
       return;
     }
 
-    const cleanId = identifier.trim();
     let row = db
-      .prepare(`SELECT * FROM users WHERE UPPER(employee_code) = UPPER(?) LIMIT 1`)
-      .get(cleanId) as any;
+      .prepare(`SELECT * FROM users WHERE UPPER(REPLACE(employee_code, ' ', '')) = UPPER(?) LIMIT 1`)
+      .get(compactId) as any;
 
     if (!row && cleanId) {
+      const compactDigits = cleanId.replace(/[\s-]/g, '');
       row = db
-        .prepare(`SELECT * FROM users WHERE (mobile != '' AND mobile = ?) OR LOWER(email) = LOWER(?) LIMIT 1`)
-        .get(cleanId, cleanId) as any;
+        .prepare(
+          `SELECT * FROM users WHERE (mobile != '' AND (mobile = ? OR REPLACE(REPLACE(mobile, ' ', ''), '-', '') = ?)) OR LOWER(email) = LOWER(?) LIMIT 1`
+        )
+        .get(cleanId, compactDigits, cleanId) as any;
     }
 
-    if (!row || !bcrypt.compareSync(password, row.password_hash)) {
-      res.status(401).json({ error: 'Invalid credentials' });
+    if (!row) {
+      res.status(401).json({
+        error: `Employee ID "${cleanId}" not found. Check spelling or ask Super Admin to verify this ID in Admin Console.`,
+      });
+      return;
+    }
+
+    let passwordMatched =
+      bcrypt.compareSync(rawPass, row.password_hash) ||
+      (trimmedPass !== rawPass && bcrypt.compareSync(trimmedPass, row.password_hash));
+
+    // Self-heal any legacy password accidentally saved with leading/trailing whitespace
+    if (!passwordMatched) {
+      const legacySpaceVariants = [` ${trimmedPass}`, `${trimmedPass} `, ` ${trimmedPass} `];
+      for (const variant of legacySpaceVariants) {
+        if (bcrypt.compareSync(variant, row.password_hash)) {
+          passwordMatched = true;
+          const healedHash = bcrypt.hashSync(trimmedPass, 10);
+          db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(healedHash, row.id);
+          break;
+        }
+      }
+    }
+
+    if (!passwordMatched) {
+      res.status(401).json({
+        error: 'Incorrect password for this Employee ID. Check spelling & uppercase/lowercase letters, or ask Super Admin to reset password.',
+      });
       return;
     }
     if (!row.is_active) {
@@ -1151,6 +1430,85 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     res.json({ user: loadUserById(req.user!.id) });
   });
 
+  // Self-service Profile Edit & Update (All roles: Super Admin, BM, TL, Back Office, Field Officer, Referral)
+  router.patch('/auth/profile', requireAuth, (req: AuthedRequest, res) => {
+    const { fullName, mobile, email, profilePhotoDataUrl } = req.body as {
+      fullName?: string;
+      mobile?: string;
+      email?: string;
+      profilePhotoDataUrl?: string | null;
+    };
+
+    const existing = loadUserById(req.user!.id);
+    if (!existing) {
+      res.status(404).json({ error: 'User profile not found' });
+      return;
+    }
+
+    const nextName = typeof fullName === 'string' ? fullName.trim() : existing.fullName;
+    if (nextName.length < 2 || nextName.length > 100) {
+      res.status(400).json({ error: 'Full Name must be between 2 and 100 characters' });
+      return;
+    }
+
+    let nextMobile = existing.mobile;
+    if (typeof mobile === 'string') {
+      const cleanedMobile = mobile.replace(/[^0-9+]/g, '').trim();
+      const digitsOnly = cleanedMobile.replace(/\D/g, '');
+      if (digitsOnly.length < 10 || digitsOnly.length > 15) {
+        res.status(400).json({ error: 'Please enter a valid 10 to 15 digit Mobile Number' });
+        return;
+      }
+      nextMobile = digitsOnly.length === 12 && digitsOnly.startsWith('91') ? digitsOnly.slice(2) : digitsOnly;
+    }
+
+    let nextEmail = existing.email;
+    if (typeof email === 'string') {
+      const cleanedEmail = email.trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanedEmail)) {
+        res.status(400).json({ error: 'Please enter a valid Email ID' });
+        return;
+      }
+      nextEmail = cleanedEmail;
+    }
+
+    let nextPhoto: string | null = existing.profilePhotoDataUrl ?? null;
+    if (profilePhotoDataUrl === null) {
+      nextPhoto = null;
+    } else if (typeof profilePhotoDataUrl === 'string') {
+      const trimmedPhoto = profilePhotoDataUrl.trim();
+      if (!trimmedPhoto) {
+        nextPhoto = null;
+      } else {
+        if (!/^data:image\/(png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=]+$/i.test(trimmedPhoto)) {
+          res.status(400).json({ error: 'Profile photo must be a valid PNG, JPEG, or WebP image' });
+          return;
+        }
+        if (trimmedPhoto.length > 2_500_000) {
+          res.status(400).json({ error: 'Profile photo is too large (max ~1.8 MB)' });
+          return;
+        }
+        nextPhoto = trimmedPhoto;
+      }
+    }
+
+    db.prepare(`
+      UPDATE users
+      SET full_name = ?, mobile = ?, email = ?, profile_photo_data_url = ?
+      WHERE id = ?
+    `).run(nextName, nextMobile, nextEmail, nextPhoto, req.user!.id);
+
+    const updated = loadUserById(req.user!.id)!;
+    logAudit(
+      updated,
+      'PROFILE_UPDATED',
+      'USER',
+      updated.employeeCode,
+      `Updated own profile (${updated.fullName}, ${updated.mobile}, ${updated.email})`
+    );
+    res.json({ user: updated });
+  });
+
   // Organization Directory (Branch Managers -> Team Leaders -> Field Officers -> Referrals)
   router.get('/directory', requireAuth, (req: AuthedRequest, res) => {
     const branches = db.prepare('SELECT id, code, name, city, state, is_active FROM branches ORDER BY name').all();
@@ -1179,14 +1537,35 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       .prepare(`
         SELECT u.id, u.employee_code as employeeCode, u.full_name as fullName, u.mobile, u.role,
           u.branch_id as branchId, b.name as branchName, b.city as branchCity, b.state as branchState,
-          u.team_id as teamId, u.reports_to_user_id as reportsToUserId,
-          u.service_city as serviceCity, u.service_pincodes as servicePincodes
+          u.team_id as teamId, t.name as teamName, u.reports_to_user_id as reportsToUserId,
+          u.service_city as serviceCity, u.service_pincodes as servicePincodes,
+          tl.id as teamLeaderId, tl.full_name as teamLeaderName, tl.employee_code as teamLeaderCode,
+          bm.id as branchManagerId, bm.full_name as branchManagerName, bm.employee_code as branchManagerCode
         FROM users u
         LEFT JOIN branches b ON b.id = u.branch_id
+        LEFT JOIN teams t ON t.id = u.team_id
+        LEFT JOIN users tl ON tl.id = COALESCE(
+          CASE WHEN u.role = 'TEAM_LEADER' THEN u.id ELSE u.reports_to_user_id END,
+          t.leader_user_id
+        )
+        LEFT JOIN users bm ON bm.id = COALESCE(
+          tl.reports_to_user_id,
+          (SELECT bmu.id FROM users bmu WHERE bmu.role = 'BRANCH_MANAGER' AND bmu.branch_id = u.branch_id AND bmu.is_active = 1 LIMIT 1)
+        )
         WHERE u.role IN ('FIELD_OFFICER', 'TEAM_LEADER') AND u.is_active = 1
         ORDER BY CASE WHEN u.role = 'FIELD_OFFICER' THEN 0 ELSE 1 END, u.full_name
       `)
-      .all();
+      .all()
+      .map((fo: any) => ({
+        ...fo,
+        workingLocation: [
+          fo.serviceCity || fo.branchCity,
+          fo.branchName,
+          fo.servicePincodes ? `Zones: ${fo.servicePincodes}` : null,
+        ]
+          .filter(Boolean)
+          .join(' · '),
+      }));
     const referrals =
       req.user!.role === 'REFERRAL_PARTNER'
         ? []
@@ -1226,6 +1605,30 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     const approvedCases = leads.filter((l) => ['Approved', 'Disbursement Pending'].includes(l.status)).length;
     const rejectedCases = leads.filter((l) => l.status === 'Rejected').length;
     const disbursedCases = leads.filter((l) => l.status === 'Disbursed').length;
+    const closedCases = leads.filter((l) => l.status === 'Closed').length;
+
+    const statusCountsMap = new Map<string, number>();
+    for (const st of CASE_STATUSES) {
+      statusCountsMap.set(st, 0);
+    }
+    for (const l of leads) {
+      const st = String(l.status || 'Lead Generated');
+      statusCountsMap.set(st, (statusCountsMap.get(st) ?? 0) + 1);
+    }
+    const stageGroupFor = (status: string): 'New' | 'In-Progress' | 'Approved' | 'Disbursed' | 'Rejected' | 'Closed' => {
+      if (status === 'Lead Generated' || status === 'Lead Assigned') return 'New';
+      if (status === 'Approved' || status === 'Disbursement Pending') return 'Approved';
+      if (status === 'Disbursed') return 'Disbursed';
+      if (status === 'Rejected') return 'Rejected';
+      if (status === 'Closed') return 'Closed';
+      return 'In-Progress';
+    };
+    const statusDistribution = CASE_STATUSES.map((st) => ({
+      status: st,
+      stageGroup: stageGroupFor(st),
+      count: statusCountsMap.get(st) ?? 0,
+    }));
+
     const totalDisbursementAmount =
       user.role === 'REFERRAL_PARTNER'
         ? null // Referral partners cannot view loan amounts
@@ -1293,22 +1696,31 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       `)
       .get(...penaltyParams) as any;
 
-    // Petrol incentive summary
-    const bikeFilter =
-      user.role === 'FIELD_OFFICER'
-        ? `WHERE status = 'COMPLETED' AND employee_id = ?`
-        : user.role === 'REFERRAL_PARTNER'
-        ? 'WHERE 1 = 0'
-        : `WHERE status = 'COMPLETED'`;
-    const bikeParams = user.role === 'FIELD_OFFICER' ? [user.id] : [];
+    // Petrol incentive summary (role & hierarchy scoped)
+    let bikeFilter = `WHERE br.status = 'COMPLETED'`;
+    const bikeParams: any[] = [];
+    if (user.role === 'FIELD_OFFICER' || user.role === 'LEAD_GENERATOR') {
+      bikeFilter += ` AND br.employee_id = ?`;
+      bikeParams.push(user.id);
+    } else if (user.role === 'TEAM_LEADER') {
+      bikeFilter += ` AND (br.employee_id = ? OR (u.role = 'FIELD_OFFICER' AND (u.reports_to_user_id = ? OR (u.reports_to_user_id IS NULL AND u.team_id = ?))))`;
+      bikeParams.push(user.id, user.id, user.teamId || -1);
+    } else if (user.role === 'BRANCH_MANAGER') {
+      bikeFilter += ` AND (br.employee_id = ? OR u.reports_to_user_id = ? OR (u.branch_id = ? AND u.role IN ('TEAM_LEADER','FIELD_OFFICER')))`;
+      bikeParams.push(user.id, user.id, user.branchId || -1);
+    } else if (user.role === 'REFERRAL_PARTNER') {
+      bikeFilter = 'WHERE 1 = 0';
+    }
     const petrolStats = db
       .prepare(`
         SELECT
           COUNT(*) as totalRuns,
-          COALESCE(SUM(eligible_km), 0) as totalKm,
-          COALESCE(SUM(CASE WHEN approval_status = 'APPROVED' THEN incentive_amount ELSE 0 END), 0) as approvedIncentive,
-          COALESCE(SUM(CASE WHEN approval_status = 'PENDING' THEN incentive_amount ELSE 0 END), 0) as pendingIncentive
-        FROM bike_runs ${bikeFilter}
+          COALESCE(SUM(br.eligible_km), 0) as totalKm,
+          COALESCE(SUM(CASE WHEN br.approval_status IN ('APPROVED','DEDUCTED') THEN br.incentive_amount ELSE 0 END), 0) as approvedIncentive,
+          COALESCE(SUM(CASE WHEN br.approval_status = 'PENDING' THEN br.incentive_amount ELSE 0 END), 0) as pendingIncentive
+        FROM bike_runs br
+        JOIN users u ON u.id = br.employee_id
+        ${bikeFilter}
       `)
       .get(...bikeParams) as any;
 
@@ -1316,6 +1728,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     let employeePerformance: any[] = [];
     let referralPerformance: any[] = [];
     if (user.role !== 'REFERRAL_PARTNER') {
+      const isFieldOfficer = user.role === 'FIELD_OFFICER';
       employeePerformance = db
         .prepare(`
           SELECT
@@ -1325,11 +1738,11 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
             COALESCE(SUM(CASE WHEN l.status = 'Disbursed' THEN l.loan_amount ELSE 0 END), 0) as disbursedAmount
           FROM users u
           LEFT JOIN leads l ON l.assigned_officer_id = u.id
-          WHERE u.role = 'FIELD_OFFICER' AND u.is_active = 1
+          WHERE u.role = 'FIELD_OFFICER' AND u.is_active = 1 ${isFieldOfficer ? 'AND u.id = ?' : ''}
           GROUP BY u.id
           ORDER BY totalLeads DESC
         `)
-        .all();
+        .all(...(isFieldOfficer ? [user.id] : []));
 
       referralPerformance = db
         .prepare(`
@@ -1403,6 +1816,40 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         };
       }
 
+      let todayAttendance: {
+        marked: boolean;
+        status: string | null;
+        markedTimeIst: string | null;
+        attendanceCode: string | null;
+        delayPenaltyAmount: number;
+      } | null = null;
+      if (user.role !== 'REFERRAL_PARTNER') {
+        const ist = getIstDateTimeParts();
+        const attRow = db
+          .prepare(`
+            SELECT attendance_code as attendanceCode, status, marked_time_ist as markedTimeIst,
+              delay_penalty_amount as delayPenaltyAmount
+            FROM attendance_logs
+            WHERE employee_id = ? AND attendance_date = ?
+          `)
+          .get(user.id, ist.istDate) as any;
+        todayAttendance = attRow
+          ? {
+              marked: true,
+              status: attRow.status,
+              markedTimeIst: attRow.markedTimeIst,
+              attendanceCode: attRow.attendanceCode,
+              delayPenaltyAmount: Number(attRow.delayPenaltyAmount || 0),
+            }
+          : {
+              marked: false,
+              status: null,
+              markedTimeIst: null,
+              attendanceCode: null,
+              delayPenaltyAmount: 0,
+            };
+      }
+
       res.json({
       kpis: {
         totalLeads,
@@ -1415,13 +1862,16 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         approvedCases,
         rejectedCases,
         disbursedCases,
+        closedCases,
         totalDisbursementAmount,
         pendingEnquiries,
         pendingDuplicates,
       },
+      statusDistribution,
       penaltySummary: penaltyStats,
       petrolSummary: petrolStats,
       rewardSummary,
+      todayAttendance,
       employeePerformance,
       referralPerformance,
       settings: getSettings(),
@@ -1448,12 +1898,19 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
           ao.full_name as assigned_officer_name,
           ao.employee_code as assigned_officer_code,
           ao.mobile as assigned_officer_mobile,
+          rb.full_name as rejected_by_name,
+          rb.employee_code as rejected_by_code,
+          crb.full_name as closure_requested_by_name,
+          cab.full_name as closure_approved_by_name,
           b.name as branch_name
         FROM leads l
         JOIN users cb ON cb.id = l.created_by
         LEFT JOIN users bm ON bm.id = l.assigned_bm_id
         LEFT JOIN users tl ON tl.id = l.assigned_tl_id
         LEFT JOIN users ao ON ao.id = l.assigned_officer_id
+        LEFT JOIN users rb ON rb.id = l.rejected_by
+        LEFT JOIN users crb ON crb.id = l.closure_requested_by
+        LEFT JOIN users cab ON cab.id = l.closure_approved_by
         LEFT JOIN branches b ON b.id = l.branch_id
         WHERE ${scope.sql}
         ORDER BY l.created_at DESC, l.id DESC
@@ -1485,6 +1942,8 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         );
       } else if (source === 'UNASSIGNED') {
         serialized = serialized.filter((l) => !l.assignedOfficerId);
+      } else if (source === 'PENDING_CLOSURE') {
+        serialized = serialized.filter((l) => l.status === 'Rejected' || l.closureStatus === 'PENDING_APPROVAL');
       }
     }
     if (search && search.trim()) {
@@ -2192,12 +2651,18 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         SELECT l.*, cb.full_name as created_by_name, cb.role as created_by_role, cb.employee_code as created_by_code,
           bm.full_name as assigned_bm_name, bm.employee_code as assigned_bm_code,
           tl.full_name as assigned_tl_name, tl.employee_code as assigned_tl_code,
-          ao.full_name as assigned_officer_name, ao.employee_code as assigned_officer_code, ao.mobile as assigned_officer_mobile, b.name as branch_name
+          ao.full_name as assigned_officer_name, ao.employee_code as assigned_officer_code, ao.mobile as assigned_officer_mobile,
+          rb.full_name as rejected_by_name, rb.employee_code as rejected_by_code,
+          crb.full_name as closure_requested_by_name, cab.full_name as closure_approved_by_name,
+          b.name as branch_name
         FROM leads l
         JOIN users cb ON cb.id = l.created_by
         LEFT JOIN users bm ON bm.id = l.assigned_bm_id
         LEFT JOIN users tl ON tl.id = l.assigned_tl_id
         LEFT JOIN users ao ON ao.id = l.assigned_officer_id
+        LEFT JOIN users rb ON rb.id = l.rejected_by
+        LEFT JOIN users crb ON crb.id = l.closure_requested_by
+        LEFT JOIN users cab ON cab.id = l.closure_approved_by
         LEFT JOIN branches b ON b.id = l.branch_id
         WHERE l.id = ?
       `)
@@ -2689,13 +3154,106 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     const isLostStatus = status === 'Rejected' || status === 'Closed';
     const cleanLostReason = isLostStatus && lostReason ? String(lostReason).trim() : isLostStatus ? lead.lost_reason || 'Other' : null;
     const now = nowSql();
-    db.prepare(`UPDATE leads SET status = ?, lost_reason = ?, last_status_at = ?, updated_at = ? WHERE id = ?`).run(
-      status,
-      cleanLostReason,
-      now,
-      now,
-      leadId
-    );
+
+    // Enforce Seniority Approval Rule when closing a lead (Field Officer -> Team Leader | Team Leader -> Branch Manager | Branch Manager -> Super Admin)
+    if (status === 'Closed') {
+      const targetActorRole =
+        lead.status === 'Rejected'
+          ? resolveLeadClosureSeniority(lead).actorRole
+          : user.role;
+      const seniority = resolveLeadClosureSeniority({
+        ...lead,
+        rejected_by_role: lead.status === 'Rejected' ? lead.rejected_by_role : targetActorRole,
+      });
+      if (user.role !== seniority.expectedApproverRole) {
+        const prefix =
+          lead.status === 'Rejected'
+            ? `Seniority Approval Rule: Leads rejected by ${seniority.actorRole.replace(/_/g, ' ')} can only be approved for Closed status by ${seniority.expectedApproverLabel}.`
+            : `Seniority Approval Rule: Mark the lead as 'Rejected' first or submit it for Close Approval to ${seniority.expectedApproverLabel}.`;
+        res.status(403).json({ error: prefix });
+        return;
+      }
+      db.prepare(`
+        UPDATE leads
+        SET status = 'Closed',
+            lost_reason = COALESCE(?, lost_reason),
+            closure_status = 'APPROVED',
+            closure_approved_by = ?,
+            closure_approved_at = ?,
+            closure_remarks = COALESCE(?, closure_remarks),
+            last_status_at = ?,
+            updated_at = ?
+        WHERE id = ?
+      `).run(cleanLostReason, user.id, now, remarks ? String(remarks).trim() : null, now, now, leadId);
+    } else if (status === 'Rejected') {
+      const seniority = resolveLeadClosureSeniority({
+        ...lead,
+        rejected_by_role: user.role,
+      });
+      db.prepare(`
+        UPDATE leads
+        SET status = 'Rejected',
+            lost_reason = ?,
+            rejected_by = ?,
+            rejected_by_role = ?,
+            rejected_at = ?,
+            closure_status = 'PENDING_APPROVAL',
+            closure_requested_by = ?,
+            closure_requested_at = ?,
+            closure_approved_by = NULL,
+            closure_approved_at = NULL,
+            last_status_at = ?,
+            updated_at = ?
+        WHERE id = ?
+      `).run(cleanLostReason, user.id, user.role, now, user.id, now, now, now, leadId);
+
+      // Dispatch alert to Seniority Approver (FO -> TL | TL/LG -> BM | BM -> Super Admin)
+      const approverIds = new Set<number>();
+      if (seniority.expectedApproverRole === 'TEAM_LEADER') {
+        if (lead.assigned_tl_id) approverIds.add(Number(lead.assigned_tl_id));
+        const userRow = db.prepare(`SELECT reports_to_user_id, team_id FROM users WHERE id = ?`).get(user.id) as any;
+        if (userRow?.reports_to_user_id) approverIds.add(Number(userRow.reports_to_user_id));
+        if (approverIds.size === 0 && userRow?.team_id) {
+          const teamRow = db.prepare(`SELECT leader_user_id FROM teams WHERE id = ?`).get(userRow.team_id) as any;
+          if (teamRow?.leader_user_id) approverIds.add(Number(teamRow.leader_user_id));
+        }
+      } else if (seniority.expectedApproverRole === 'BRANCH_MANAGER') {
+        if (lead.assigned_bm_id) approverIds.add(Number(lead.assigned_bm_id));
+        const userRow = db.prepare(`SELECT reports_to_user_id, branch_id FROM users WHERE id = ?`).get(user.id) as any;
+        if (userRow?.reports_to_user_id) approverIds.add(Number(userRow.reports_to_user_id));
+        if (approverIds.size === 0 && (lead.branch_id || userRow?.branch_id)) {
+          const bms = db
+            .prepare(`SELECT id FROM users WHERE role = 'BRANCH_MANAGER' AND branch_id = ? AND is_active = 1`)
+            .all(lead.branch_id || userRow?.branch_id) as { id: number }[];
+          for (const b of bms) approverIds.add(b.id);
+        }
+      } else {
+        for (const aid of getSuperAdminIds()) approverIds.add(aid);
+      }
+      for (const targetId of approverIds) {
+        if (targetId === user.id) continue;
+        createAlert({
+          userId: targetId,
+          leadId,
+          category: 'Lead Follow-up Alert',
+          titleEn: `Close Approval Needed (${lead.lead_code})`,
+          titleHi: `लीड क्लोज़ स्वीकृति आवश्यक (${lead.lead_code})`,
+          messageEn: `${user.fullName} (${user.employeeCode}) marked ${lead.lead_code} as Rejected (${cleanLostReason}). Seniority Close Approval required by ${seniority.expectedApproverLabel}.`,
+          messageHi: `${user.fullName} (${user.employeeCode}) ने ${lead.lead_code} को Rejected (${cleanLostReason}) किया है। कृपया ${seniority.expectedApproverLabel} के रूप में Close Approval दें।`,
+        });
+      }
+    } else {
+      db.prepare(`
+        UPDATE leads
+        SET status = ?,
+            lost_reason = ?,
+            closure_status = CASE WHEN status = 'Rejected' THEN 'REJECTED_REOPENED' ELSE COALESCE(closure_status, 'NONE') END,
+            last_status_at = ?,
+            updated_at = ?
+        WHERE id = ?
+      `).run(status, cleanLostReason, now, now, leadId);
+    }
+
     const historyNote = [remarks, cleanLostReason ? `Reason: ${cleanLostReason}` : null].filter(Boolean).join(' · ') || null;
     db.prepare(`
       INSERT INTO case_history (lead_id, prev_status, new_status, updated_by, remarks, created_at)
@@ -2817,6 +3375,110 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       wrongLeadPenaltyApplied,
     });
   });
+
+  // Seniority-Wise Close Approval / Re-open for Rejected Leads
+  // Rule: Field Officer -> Team Leader | Team Leader -> Branch Manager | Branch Manager -> Super Admin
+  router.patch(
+    '/leads/:id/closure-decision',
+    requireAuth,
+    requireRoles('SUPER_ADMIN', 'BRANCH_MANAGER', 'TEAM_LEADER'),
+    (req: AuthedRequest, res) => {
+      const user = req.user!;
+      const leadId = Number(req.params.id);
+      const { decision, remarks } = req.body as {
+        decision?: 'APPROVE_CLOSE' | 'REOPEN';
+        remarks?: string;
+      };
+
+      if (!decision || !['APPROVE_CLOSE', 'REOPEN'].includes(decision)) {
+        res.status(400).json({ error: 'Decision must be APPROVE_CLOSE or REOPEN' });
+        return;
+      }
+
+      const lead = db.prepare('SELECT * FROM leads WHERE id = ?').get(leadId) as any;
+      if (!lead) {
+        res.status(404).json({ error: 'Lead not found' });
+        return;
+      }
+      if (!canUserAccessLead(lead, user)) {
+        res.status(403).json({ error: 'You are not authorized to review closure for this lead' });
+        return;
+      }
+      if (lead.status !== 'Rejected') {
+        res.status(400).json({ error: 'Seniority close approval applies to leads marked Rejected' });
+        return;
+      }
+
+      const seniority = resolveLeadClosureSeniority(lead);
+      if (user.role !== seniority.expectedApproverRole) {
+        res.status(403).json({
+          error: `Seniority Approval Rule: Leads rejected by ${seniority.actorRole.replace(/_/g, ' ')} can only be approved by ${seniority.expectedApproverLabel}.`,
+        });
+        return;
+      }
+
+      const now = nowSql();
+      const nextStatus: CaseStatus = decision === 'APPROVE_CLOSE' ? 'Closed' : 'Follow-up Pending';
+      const nextClosureStatus = decision === 'APPROVE_CLOSE' ? 'APPROVED' : 'REJECTED_REOPENED';
+      const cleanRemarks = remarks ? String(remarks).trim() : null;
+
+      db.prepare(`
+        UPDATE leads
+        SET status = ?,
+            closure_status = ?,
+            closure_approved_by = ?,
+            closure_approved_at = ?,
+            closure_remarks = ?,
+            last_status_at = ?,
+            updated_at = ?
+        WHERE id = ?
+      `).run(nextStatus, nextClosureStatus, user.id, now, cleanRemarks, now, now, leadId);
+
+      const historyNote =
+        decision === 'APPROVE_CLOSE'
+          ? `Seniority Close Approved by ${user.fullName} (${user.role.replace(/_/g, ' ')})${cleanRemarks ? ` · ${cleanRemarks}` : ''}`
+          : `Closure Rejected & Re-opened to Follow-up Pending by ${user.fullName}${cleanRemarks ? ` · ${cleanRemarks}` : ''}`;
+
+      db.prepare(`
+        INSERT INTO case_history (lead_id, prev_status, new_status, updated_by, remarks, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(leadId, lead.status, nextStatus, user.id, historyNote, now);
+
+      db.prepare(`UPDATE followup_reminders SET completed_at = ? WHERE lead_id = ? AND completed_at IS NULL`).run(now, leadId);
+
+      const notifyIds = new Set<number>();
+      if (lead.rejected_by && lead.rejected_by !== user.id) notifyIds.add(Number(lead.rejected_by));
+      if (lead.assigned_officer_id && lead.assigned_officer_id !== user.id) notifyIds.add(Number(lead.assigned_officer_id));
+      if (lead.created_by && lead.created_by !== user.id) notifyIds.add(Number(lead.created_by));
+      for (const uid of notifyIds) {
+        createAlert({
+          userId: uid,
+          leadId,
+          category: 'Lead Follow-up Alert',
+          titleEn:
+            decision === 'APPROVE_CLOSE'
+              ? `Lead Close Approved: ${lead.lead_code}`
+              : `Rejected Lead Re-opened: ${lead.lead_code}`,
+          titleHi:
+            decision === 'APPROVE_CLOSE'
+              ? `लीड क्लोज़ स्वीकृत: ${lead.lead_code}`
+              : `रिजेक्ट लीड पुनः खोली गई: ${lead.lead_code}`,
+          messageEn: historyNote,
+          messageHi: historyNote,
+        });
+      }
+
+      logAudit(
+        user,
+        decision === 'APPROVE_CLOSE' ? 'LEAD_CLOSURE_APPROVED' : 'LEAD_CLOSURE_REOPENED',
+        'LEAD',
+        lead.lead_code,
+        historyNote
+      );
+
+      res.json({ ok: true, status: nextStatus, closureStatus: nextClosureStatus });
+    }
+  );
 
   // Log Missing Document Follow-up Reminder
   router.post('/leads/:id/doc-reminder', requireAuth, (req: AuthedRequest, res) => {
@@ -3785,6 +4447,79 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     res.status(201).json({ ok: true });
   });
 
+  // Seniority-wise Bike Run Approver Helpers:
+  // Field Officer -> Team Leader | Team Leader -> Branch Manager | Branch Manager / Staff -> Super Admin
+  const getExpectedBikeApproverRole = (
+    employeeRole: string
+  ): 'TEAM_LEADER' | 'BRANCH_MANAGER' | 'SUPER_ADMIN' => {
+    if (employeeRole === 'FIELD_OFFICER') return 'TEAM_LEADER';
+    if (employeeRole === 'TEAM_LEADER') return 'BRANCH_MANAGER';
+    return 'SUPER_ADMIN';
+  };
+
+  const getExpectedApproverRoleLabel = (role: 'TEAM_LEADER' | 'BRANCH_MANAGER' | 'SUPER_ADMIN') => {
+    if (role === 'TEAM_LEADER') return 'Team Leader';
+    if (role === 'BRANCH_MANAGER') return 'Branch Manager';
+    return 'Super Admin';
+  };
+
+  const canUserReviewBikeRun = (
+    reviewer: { id: number; role: string; branchId: number | null; teamId: number | null },
+    employee: {
+      id: number;
+      role: string;
+      branchId: number | null;
+      teamId: number | null;
+      reportsToUserId: number | null;
+    }
+  ): boolean => {
+    if (reviewer.id === employee.id) return false;
+    const expectedRole = getExpectedBikeApproverRole(employee.role);
+    if (reviewer.role !== expectedRole) return false;
+    if (expectedRole === 'SUPER_ADMIN') return true;
+    if (expectedRole === 'TEAM_LEADER') {
+      if (employee.reportsToUserId) return employee.reportsToUserId === reviewer.id;
+      if (employee.teamId && reviewer.teamId) return employee.teamId === reviewer.teamId;
+      return Boolean(employee.branchId && reviewer.branchId && employee.branchId === reviewer.branchId);
+    }
+    // expectedRole === 'BRANCH_MANAGER'
+    if (employee.reportsToUserId) return employee.reportsToUserId === reviewer.id;
+    return Boolean(employee.branchId && reviewer.branchId && employee.branchId === reviewer.branchId);
+  };
+
+  const resolveExpectedApproverUsers = (employee: {
+    id: number;
+    role: string;
+    branchId: number | null;
+    teamId: number | null;
+    reportsToUserId: number | null;
+  }): { id: number; fullName: string; employeeCode: string }[] => {
+    const expectedRole = getExpectedBikeApproverRole(employee.role);
+    if (expectedRole === 'SUPER_ADMIN') {
+      return db
+        .prepare(`SELECT id, full_name as fullName, employee_code as employeeCode FROM users WHERE role = 'SUPER_ADMIN' AND is_active = 1`)
+        .all() as any[];
+    }
+    if (employee.reportsToUserId) {
+      const direct = db
+        .prepare(`SELECT id, full_name as fullName, employee_code as employeeCode FROM users WHERE id = ? AND role = ? AND is_active = 1`)
+        .get(employee.reportsToUserId, expectedRole) as any;
+      if (direct) return [direct];
+    }
+    if (expectedRole === 'TEAM_LEADER' && employee.teamId) {
+      const byTeam = db
+        .prepare(`SELECT id, full_name as fullName, employee_code as employeeCode FROM users WHERE team_id = ? AND role = 'TEAM_LEADER' AND is_active = 1`)
+        .all(employee.teamId) as any[];
+      if (byTeam.length > 0) return byTeam;
+    }
+    if (employee.branchId) {
+      return db
+        .prepare(`SELECT id, full_name as fullName, employee_code as employeeCode FROM users WHERE branch_id = ? AND role = ? AND is_active = 1`)
+        .all(employee.branchId, expectedRole) as any[];
+    }
+    return [];
+  };
+
   // GPS Bike Run & Petrol Incentive Module
   router.get('/bike-runs', requireAuth, (req: AuthedRequest, res) => {
     const user = req.user!;
@@ -3792,36 +4527,80 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       res.status(403).json({ error: 'Bike run records are restricted to field staff and management' });
       return;
     }
-    const isOwnRuns = user.role === 'FIELD_OFFICER' || user.role === 'LEAD_GENERATOR';
-    const where = isOwnRuns ? 'WHERE br.employee_id = ?' : '';
-    const params = isOwnRuns ? [user.id] : [];
+
+    let where = '';
+    const params: any[] = [];
+    if (user.role === 'FIELD_OFFICER' || user.role === 'LEAD_GENERATOR') {
+      where = 'WHERE br.employee_id = ?';
+      params.push(user.id);
+    } else if (user.role === 'TEAM_LEADER') {
+      where = `WHERE (br.employee_id = ? OR (u.role = 'FIELD_OFFICER' AND (u.reports_to_user_id = ? OR (u.reports_to_user_id IS NULL AND u.team_id = ?))))`;
+      params.push(user.id, user.id, user.teamId || -1);
+    } else if (user.role === 'BRANCH_MANAGER') {
+      where = `WHERE (br.employee_id = ? OR u.reports_to_user_id = ? OR (u.branch_id = ? AND u.role IN ('TEAM_LEADER','FIELD_OFFICER')))`;
+      params.push(user.id, user.id, user.branchId || -1);
+    }
 
     const runs = db
       .prepare(`
         SELECT br.id, br.run_code as runCode, br.employee_id as employeeId,
-          u.full_name as employeeName, u.employee_code as employeeCode,
+          u.full_name as employeeName, u.employee_code as employeeCode, u.role as employeeRole,
+          u.branch_id as employeeBranchId, u.team_id as employeeTeamId, u.reports_to_user_id as employeeReportsToUserId,
+          br.lead_id as leadId, l.lead_code as leadCode,
+          br.customer_name as customerName, br.tour_reason as tourReason,
+          br.start_location as startLocation, br.end_location as endLocation,
           br.start_time as startTime, br.end_time as endTime,
           br.start_lat as startLat, br.start_lng as startLng,
           br.end_lat as endLat, br.end_lng as endLng,
           br.opening_odometer as openingOdometer, br.closing_odometer as closingOdometer,
           br.gps_distance_km as gpsDistanceKm, br.odometer_distance_km as odometerDistanceKm,
           br.discrepancy_km as discrepancyKm, br.discrepancy_flag as discrepancyFlag,
-          br.rate_per_km as ratePerKm, br.eligible_km as eligibleKm, br.incentive_amount as incentiveAmount,
-          br.approval_status as approvalStatus, br.reviewed_by as reviewedBy, rev.full_name as reviewedByName,
+          br.rate_per_km as ratePerKm, br.eligible_km as eligibleKm,
+          br.gross_amount as grossAmount, br.deducted_amount as deductedAmount, br.incentive_amount as incentiveAmount,
+          br.approval_status as approvalStatus, br.reviewed_by as reviewedBy,
+          rev.full_name as reviewedByName, br.reviewer_role as reviewerRole,
           br.review_remarks as reviewRemarks, br.reviewed_at as reviewedAt,
           br.route_points_json as routePointsJson, br.status
         FROM bike_runs br
         JOIN users u ON u.id = br.employee_id
+        LEFT JOIN leads l ON l.id = br.lead_id
         LEFT JOIN users rev ON rev.id = br.reviewed_by
         ${where}
         ORDER BY br.start_time DESC
       `)
       .all(...params)
-      .map((r: any) => ({
-        ...r,
-        discrepancyFlag: Boolean(r.discrepancyFlag),
-        routePoints: JSON.parse(r.routePointsJson || '[]'),
-      }));
+      .map((r: any) => {
+        const empObj = {
+          id: Number(r.employeeId),
+          role: String(r.employeeRole),
+          branchId: r.employeeBranchId ?? null,
+          teamId: r.employeeTeamId ?? null,
+          reportsToUserId: r.employeeReportsToUserId ?? null,
+        };
+        const expectedApproverRole = getExpectedBikeApproverRole(empObj.role);
+        const expectedApproverLabel = getExpectedApproverRoleLabel(expectedApproverRole);
+        const approvers = resolveExpectedApproverUsers(empObj);
+        const rate = Number(r.ratePerKm || 3.0);
+        const grossAmount =
+          r.grossAmount && Number(r.grossAmount) > 0
+            ? Number(r.grossAmount)
+            : Math.round(Number(r.eligibleKm || 0) * rate * 100) / 100;
+        const deductedAmount = Number(r.deductedAmount || 0);
+        return {
+          ...r,
+          grossAmount,
+          deductedAmount,
+          expectedApproverRole,
+          expectedApproverLabel,
+          expectedApproverName: approvers[0]?.fullName || expectedApproverLabel,
+          canReview: canUserReviewBikeRun(
+            { id: user.id, role: user.role, branchId: user.branchId ?? null, teamId: user.teamId ?? null },
+            empObj
+          ),
+          discrepancyFlag: Boolean(r.discrepancyFlag),
+          routePoints: JSON.parse(r.routePointsJson || '[]'),
+        };
+      });
 
     res.json({ runs, petrolRatePerKm: getSettings().petrolRatePerKm });
   });
@@ -3832,10 +4611,22 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       res.status(403).json({ error: 'Unauthorized' });
       return;
     }
-    const { openingOdometer, latitude, longitude } = req.body as {
+    const {
+      openingOdometer,
+      latitude,
+      longitude,
+      leadId,
+      customerName,
+      tourReason,
+      startLocation,
+    } = req.body as {
       openingOdometer?: number;
       latitude?: number;
       longitude?: number;
+      leadId?: number;
+      customerName?: string;
+      tourReason?: string;
+      startLocation?: string;
     };
     if (openingOdometer === undefined || typeof latitude !== 'number' || typeof longitude !== 'number') {
       res.status(400).json({ error: 'Opening odometer and starting GPS coordinates are required' });
@@ -3850,6 +4641,19 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       return;
     }
 
+    let resolvedCustomer = (customerName || '').trim();
+    if (!resolvedCustomer && leadId) {
+      const leadRow = db.prepare('SELECT customer_name FROM leads WHERE id = ?').get(Number(leadId)) as { customer_name?: string } | undefined;
+      resolvedCustomer = leadRow?.customer_name || '';
+    }
+    const resolvedReason = (tourReason || '').trim();
+    const coordStr = `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`;
+    const resolvedStartLoc = startLocation?.trim()
+      ? startLocation.trim().includes(latitude.toFixed(2))
+        ? startLocation.trim()
+        : `${startLocation.trim()} (${coordStr})`
+      : coordStr;
+
     const runCode = `RUN-${Date.now().toString(36).toUpperCase().slice(-5)}`;
     const rate = getSettings().petrolRatePerKm;
     const now = nowSql();
@@ -3857,12 +4661,34 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
 
     const inserted = db
       .prepare(`
-        INSERT INTO bike_runs (run_code, employee_id, start_time, start_lat, start_lng, opening_odometer, rate_per_km, route_points_json, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+        INSERT INTO bike_runs (
+          run_code, employee_id, lead_id, customer_name, tour_reason, start_location,
+          start_time, start_lat, start_lng, opening_odometer, rate_per_km, route_points_json, status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
       `)
-      .run(runCode, user.id, now, latitude, longitude, Number(openingOdometer), rate, JSON.stringify(points));
+      .run(
+        runCode,
+        user.id,
+        leadId ? Number(leadId) : null,
+        resolvedCustomer,
+        resolvedReason,
+        resolvedStartLoc,
+        now,
+        latitude,
+        longitude,
+        Number(openingOdometer),
+        rate,
+        JSON.stringify(points)
+      );
 
-    logAudit(user, 'BIKE_RUN_STARTED', 'BIKE_RUN', runCode, `Opening Odometer ${openingOdometer} km at (${latitude}, ${longitude})`);
+    logAudit(
+      user,
+      'BIKE_RUN_STARTED',
+      'BIKE_RUN',
+      runCode,
+      `Opening Odometer ${openingOdometer} km at ${resolvedStartLoc}${resolvedCustomer ? ` | Customer: ${resolvedCustomer}` : ''}`
+    );
     res.status(201).json({ ok: true, id: inserted.lastInsertRowid, runCode });
   });
 
@@ -3892,11 +4718,22 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       return;
     }
 
-    const { closingOdometer, latitude, longitude, simulatedExtraKm } = req.body as {
+    const {
+      closingOdometer,
+      latitude,
+      longitude,
+      simulatedExtraKm,
+      customerName,
+      tourReason,
+      endLocation,
+    } = req.body as {
       closingOdometer?: number;
       latitude?: number;
       longitude?: number;
       simulatedExtraKm?: number;
+      customerName?: string;
+      tourReason?: string;
+      endLocation?: string;
     };
     if (closingOdometer === undefined || typeof latitude !== 'number' || typeof longitude !== 'number') {
       res.status(400).json({ error: 'Closing odometer and ending GPS coordinates are required' });
@@ -3926,18 +4763,33 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
 
     const rate = getSettings().petrolRatePerKm;
     const eligibleKm = Math.min(gpsKm > 0 ? gpsKm : odoKm, odoKm);
-    const incentive = Math.round(eligibleKm * rate * 100) / 100;
+    const grossAmount = Math.round(eligibleKm * rate * 100) / 100;
+
+    const resolvedCustomer = (customerName || '').trim() || run.customer_name || '';
+    const resolvedReason = (tourReason || '').trim() || run.tour_reason || '';
+    const coordStr = `${latitude.toFixed(4)}, ${longitude.toFixed(4)}`;
+    const resolvedEndLoc = endLocation?.trim()
+      ? endLocation.trim().includes(latitude.toFixed(2))
+        ? endLocation.trim()
+        : `${endLocation.trim()} (${coordStr})`
+      : coordStr;
 
     db.prepare(`
       UPDATE bike_runs
-      SET end_time = ?, end_lat = ?, end_lng = ?, closing_odometer = ?,
+      SET end_time = ?, end_lat = ?, end_lng = ?, end_location = ?,
+          customer_name = ?, tour_reason = ?,
+          closing_odometer = ?,
           gps_distance_km = ?, odometer_distance_km = ?, discrepancy_km = ?, discrepancy_flag = ?,
-          rate_per_km = ?, eligible_km = ?, incentive_amount = ?, route_points_json = ?, status = 'COMPLETED'
+          rate_per_km = ?, eligible_km = ?, gross_amount = ?, deducted_amount = 0, incentive_amount = ?,
+          route_points_json = ?, status = 'COMPLETED'
       WHERE id = ?
     `).run(
       now,
       latitude,
       longitude,
+      resolvedEndLoc,
+      resolvedCustomer,
+      resolvedReason,
       Number(closingOdometer),
       gpsKm,
       odoKm,
@@ -3945,74 +4797,1049 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       discrepancyFlag,
       rate,
       eligibleKm,
-      incentive,
+      grossAmount,
+      grossAmount,
       JSON.stringify(points),
       run.id
     );
 
-    if (discrepancyFlag) {
-      for (const admId of getSuperAdminIds()) {
-        createAlert({
-          userId: admId,
-          category: 'Field Officer GPS Location Alert',
-          titleEn: `Bike Run Discrepancy: ${run.run_code}`,
-          titleHi: `बाइक रन अंतर: ${run.run_code}`,
-          messageEn: `${user.fullName} odometer (${odoKm} km) vs GPS (${gpsKm} km) differs by ${discrepancyKm} km.`,
-          messageHi: `${user.fullName} के ओडोमीटर (${odoKm} किमी) और GPS (${gpsKm} किमी) में ${discrepancyKm} किमी का अंतर है।`,
-        });
-      }
+    // Notify seniority-wise approver about completed bike run (and flag discrepancy if any)
+    const approvers = resolveExpectedApproverUsers({
+      id: user.id,
+      role: user.role,
+      branchId: user.branchId ?? null,
+      teamId: user.teamId ?? null,
+      reportsToUserId: user.reportsToUserId ?? null,
+    });
+    const notifyIds = approvers.length > 0 ? approvers.map((a) => a.id) : getSuperAdminIds();
+    for (const mgrId of notifyIds) {
+      createAlert({
+        userId: mgrId,
+        category: 'Field Officer GPS Location Alert',
+        titleEn: discrepancyFlag
+          ? `Bike Run Discrepancy Pending Approval: ${run.run_code}`
+          : `Bike Run Bill Pending Approval: ${run.run_code}`,
+        titleHi: discrepancyFlag
+          ? `बाइक रन अंतर अनुमोदन लंबित: ${run.run_code}`
+          : `बाइक रन बिल अनुमोदन लंबित: ${run.run_code}`,
+        messageEn: `${user.fullName} completed ${eligibleKm} km @ ₹${rate}/km = ₹${grossAmount}${
+          resolvedCustomer ? ` (${resolvedCustomer})` : ''
+        }.${discrepancyFlag ? ` Odometer vs GPS diff: ${discrepancyKm} km.` : ''}`,
+        messageHi: `${user.fullName} ने ${eligibleKm} किमी × ₹${rate}/किमी = ₹${grossAmount} पूरा किया।`,
+      });
     }
 
-    logAudit(user, 'BIKE_RUN_COMPLETED', 'BIKE_RUN', run.run_code, `GPS ${gpsKm} km, Odo ${odoKm} km, Incentive ₹${incentive}`);
-    res.json({ ok: true, gpsKm, odoKm, discrepancyKm, discrepancyFlag: Boolean(discrepancyFlag), incentive });
+    logAudit(
+      user,
+      'BIKE_RUN_COMPLETED',
+      'BIKE_RUN',
+      run.run_code,
+      `GPS ${gpsKm} km, Odo ${odoKm} km, Eligible ${eligibleKm} km @ ₹${rate}/km = ₹${grossAmount}`
+    );
+    res.json({
+      ok: true,
+      gpsKm,
+      odoKm,
+      discrepancyKm,
+      discrepancyFlag: Boolean(discrepancyFlag),
+      ratePerKm: rate,
+      eligibleKm,
+      grossAmount,
+      incentive: grossAmount,
+    });
   });
 
-  router.patch('/bike-runs/:id/decision', requireAuth, requireRoles('SUPER_ADMIN'), (req: AuthedRequest, res) => {
-    const admin = req.user!;
-    const id = Number(req.params.id);
-    const { decision, eligibleKm, remarks } = req.body as {
-      decision?: 'APPROVED' | 'REJECTED';
-      eligibleKm?: number;
-      remarks?: string;
+  router.patch(
+    '/bike-runs/:id/decision',
+    requireAuth,
+    requireRoles('TEAM_LEADER', 'BRANCH_MANAGER', 'SUPER_ADMIN'),
+    (req: AuthedRequest, res) => {
+      const reviewer = req.user!;
+      const id = Number(req.params.id);
+      const { decision, eligibleKm, deductedAmount, remarks } = req.body as {
+        decision?: 'APPROVED' | 'DEDUCTED' | 'REJECTED';
+        eligibleKm?: number;
+        deductedAmount?: number;
+        remarks?: string;
+      };
+      if (!decision || !['APPROVED', 'DEDUCTED', 'REJECTED'].includes(decision)) {
+        res.status(400).json({ error: 'Decision must be APPROVED, DEDUCTED, or REJECTED' });
+        return;
+      }
+
+      const run = db.prepare('SELECT * FROM bike_runs WHERE id = ?').get(id) as any;
+      if (!run) {
+        res.status(404).json({ error: 'Bike run not found' });
+        return;
+      }
+      if (run.status !== 'COMPLETED') {
+        res.status(400).json({ error: 'Only completed bike runs can be approved, deducted, or rejected' });
+        return;
+      }
+
+      const empRow = db
+        .prepare(
+          `SELECT id, role, branch_id as branchId, team_id as teamId, reports_to_user_id as reportsToUserId FROM users WHERE id = ?`
+        )
+        .get(run.employee_id) as
+        | {
+            id: number;
+            role: string;
+            branchId: number | null;
+            teamId: number | null;
+            reportsToUserId: number | null;
+          }
+        | undefined;
+      if (!empRow) {
+        res.status(404).json({ error: 'Employee not found' });
+        return;
+      }
+
+      const expectedRole = getExpectedBikeApproverRole(empRow.role);
+      const allowed = canUserReviewBikeRun(
+        {
+          id: reviewer.id,
+          role: reviewer.role,
+          branchId: reviewer.branchId ?? null,
+          teamId: reviewer.teamId ?? null,
+        },
+        empRow
+      );
+      if (!allowed) {
+        const expectedLabel = getExpectedApproverRoleLabel(expectedRole);
+        res.status(403).json({
+          error: `Seniority hierarchy rule: ${empRow.role.replace(/_/g, ' ')} bike runs can only be approved, deducted, or rejected by their assigned ${expectedLabel}.`,
+        });
+        return;
+      }
+
+      const rate = Number(run.rate_per_km || getSettings().petrolRatePerKm || 3.0);
+      const origKm = Number(run.eligible_km || 0);
+      const origGross =
+        Number(run.gross_amount || 0) > 0
+          ? Number(run.gross_amount)
+          : Math.round(origKm * rate * 100) / 100;
+
+      const finalKm =
+        eligibleKm !== undefined && !Number.isNaN(Number(eligibleKm))
+          ? Math.max(0, Number(eligibleKm))
+          : origKm;
+      const computedGrossFromFinalKm = Math.round(finalKm * rate * 100) / 100;
+
+      let storedGross = computedGrossFromFinalKm;
+      let storedDeducted = 0;
+      let finalIncentive = computedGrossFromFinalKm;
+
+      if (decision === 'APPROVED') {
+        storedDeducted = 0;
+        finalIncentive = computedGrossFromFinalKm;
+      } else if (decision === 'DEDUCTED') {
+        const rawDeduct = Math.max(0, Number(deductedAmount || 0));
+        if (rawDeduct === 0 && finalKm < origKm) {
+          // Manager lowered eligible KM directly
+          storedGross = origGross;
+          storedDeducted = Math.round(Math.max(0, origGross - computedGrossFromFinalKm) * 100) / 100;
+          finalIncentive = computedGrossFromFinalKm;
+        } else {
+          if (rawDeduct <= 0) {
+            res.status(400).json({
+              error: 'Enter a Deduction Amount (₹) greater than 0 or lower Eligible KM when selecting Deduct.',
+            });
+            return;
+          }
+          storedGross = computedGrossFromFinalKm;
+          storedDeducted = Math.min(computedGrossFromFinalKm, Math.round(rawDeduct * 100) / 100);
+          finalIncentive = Math.round(Math.max(0, computedGrossFromFinalKm - storedDeducted) * 100) / 100;
+        }
+      } else {
+        // REJECTED
+        storedGross = computedGrossFromFinalKm;
+        storedDeducted = computedGrossFromFinalKm;
+        finalIncentive = 0;
+      }
+
+      db.prepare(`
+        UPDATE bike_runs
+        SET eligible_km = ?, gross_amount = ?, deducted_amount = ?, incentive_amount = ?,
+            approval_status = ?, reviewed_by = ?, reviewer_role = ?, review_remarks = ?, reviewed_at = ?
+        WHERE id = ?
+      `).run(
+        finalKm,
+        storedGross,
+        storedDeducted,
+        finalIncentive,
+        decision,
+        reviewer.id,
+        reviewer.role,
+        remarks?.trim() || null,
+        nowSql(),
+        id
+      );
+
+      createAlert({
+        userId: run.employee_id,
+        category: 'Field Officer GPS Location Alert',
+        titleEn: `Petrol Bill ${run.run_code} ${decision}`,
+        titleHi: `पेट्रोल बिल ${run.run_code} ${
+          decision === 'APPROVED' ? 'स्वीकृत' : decision === 'DEDUCTED' ? 'कटौती के साथ स्वीकृत' : 'अस्वीकृत'
+        }`,
+        messageEn:
+          decision === 'APPROVED'
+            ? `Approved by ${reviewer.fullName} (${getExpectedApproverRoleLabel(expectedRole)}): ${finalKm} km × ₹${rate}/km = ₹${finalIncentive}.`
+            : decision === 'DEDUCTED'
+            ? `Deducted by ${reviewer.fullName}: Gross ₹${storedGross} - Deducted ₹${storedDeducted} = Net Payable ₹${finalIncentive}.${
+                remarks ? ` Remarks: ${remarks}` : ''
+              }`
+            : `Rejected by ${reviewer.fullName}. Remarks: ${remarks || 'Discrepancy review'}`,
+        messageHi:
+          decision === 'APPROVED'
+            ? `${reviewer.fullName} द्वारा ₹${finalIncentive} (${finalKm} किमी × ₹${rate}/किमी) स्वीकृत।`
+            : decision === 'DEDUCTED'
+            ? `${reviewer.fullName} द्वारा ₹${storedDeducted} कटौती के बाद ₹${finalIncentive} स्वीकृत।`
+            : `${reviewer.fullName} द्वारा बाइक रन ${run.run_code} अस्वीकृत।`,
+      });
+
+      logAudit(
+        reviewer,
+        `BIKE_RUN_${decision}`,
+        'BIKE_RUN',
+        run.run_code,
+        `Km: ${finalKm}, Gross: ₹${storedGross}, Deducted: ₹${storedDeducted}, Net: ₹${finalIncentive}${
+          remarks ? `, Remarks: ${remarks}` : ''
+        }`
+      );
+      res.json({
+        ok: true,
+        approvalStatus: decision,
+        grossAmount: storedGross,
+        deductedAmount: storedDeducted,
+        incentiveAmount: finalIncentive,
+      });
+    }
+  );
+
+  // ============================================================================
+  // DAILY ATTENDANCE & LEAVE MANAGEMENT
+  // Self-approved attendance inside Ambika Office GPS (green <= 10:00 AM IST, ₹20/day after 10:00 AM IST)
+  // Seniority Leave Approval: FO -> TL | TL / Back Office Lead Gen -> BM | BM -> Super Admin
+  // Without approval leave -> ₹100/leave penalty
+  // ============================================================================
+  const getIstDateTimeParts = (dateObj = new Date()) => {
+    const istMs = dateObj.getTime() + 330 * 60 * 1000;
+    const d = new Date(istMs);
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const hh = d.getUTCHours();
+    const min = d.getUTCMinutes();
+    const ampm = hh >= 12 ? 'PM' : 'AM';
+    const h12 = hh % 12 === 0 ? 12 : hh % 12;
+    return {
+      istDate: `${yyyy}-${mm}-${dd}`,
+      istHour: hh,
+      istMinute: min,
+      istMinutesOfDay: hh * 60 + min,
+      istTimeDisplay: `${String(h12).padStart(2, '0')}:${String(min).padStart(2, '0')} ${ampm} IST`,
     };
-    if (!decision || !['APPROVED', 'REJECTED'].includes(decision)) {
-      res.status(400).json({ error: 'Decision must be APPROVED or REJECTED' });
+  };
+
+  const parseCutoffMinutes = (cutoffStr: string | undefined) => {
+    const [hStr, mStr] = (cutoffStr || '10:00').split(':');
+    const h = Number(hStr);
+    const m = Number(mStr);
+    return (Number.isFinite(h) ? h : 10) * 60 + (Number.isFinite(m) ? m : 0);
+  };
+
+  const getExpectedLeaveApproverRole = (
+    employeeRole: string
+  ): 'TEAM_LEADER' | 'BRANCH_MANAGER' | 'SUPER_ADMIN' => {
+    if (employeeRole === 'FIELD_OFFICER') return 'TEAM_LEADER';
+    if (employeeRole === 'TEAM_LEADER' || employeeRole === 'LEAD_GENERATOR') return 'BRANCH_MANAGER';
+    return 'SUPER_ADMIN';
+  };
+
+  const canUserReviewLeave = (
+    reviewer: { id: number; role: string; branchId: number | null; teamId: number | null },
+    applicant: {
+      id: number;
+      role: string;
+      branchId: number | null;
+      teamId: number | null;
+      reportsToUserId: number | null;
+    }
+  ): boolean => {
+    const expectedRole = getExpectedLeaveApproverRole(applicant.role);
+    if (reviewer.role !== expectedRole) return false;
+    if (applicant.role === 'SUPER_ADMIN') {
+      if (reviewer.id !== applicant.id) return true;
+      const adminCount = (db.prepare(`SELECT COUNT(*) as c FROM users WHERE role = 'SUPER_ADMIN' AND is_active = 1`).get() as { c: number }).c;
+      return adminCount <= 1;
+    }
+    if (reviewer.id === applicant.id) return false;
+    if (expectedRole === 'SUPER_ADMIN') return true;
+    if (expectedRole === 'TEAM_LEADER') {
+      if (applicant.reportsToUserId) return applicant.reportsToUserId === reviewer.id;
+      if (applicant.teamId && reviewer.teamId) return applicant.teamId === reviewer.teamId;
+      return Boolean(applicant.branchId && reviewer.branchId && applicant.branchId === reviewer.branchId);
+    }
+    // expectedRole === 'BRANCH_MANAGER' (for TEAM_LEADER & LEAD_GENERATOR)
+    if (applicant.reportsToUserId) return applicant.reportsToUserId === reviewer.id;
+    if (applicant.branchId && reviewer.branchId) return applicant.branchId === reviewer.branchId;
+    return true;
+  };
+
+  const resolveExpectedLeaveApprovers = (applicant: {
+    id: number;
+    role: string;
+    branchId: number | null;
+    teamId: number | null;
+    reportsToUserId: number | null;
+  }) => {
+    const expectedRole = getExpectedLeaveApproverRole(applicant.role);
+    if (expectedRole === 'SUPER_ADMIN') {
+      return db
+        .prepare(`SELECT id, full_name as fullName FROM users WHERE role = 'SUPER_ADMIN' AND is_active = 1`)
+        .all() as { id: number; fullName: string }[];
+    }
+    if (applicant.reportsToUserId) {
+      const direct = db
+        .prepare(`SELECT id, full_name as fullName FROM users WHERE id = ? AND role = ? AND is_active = 1`)
+        .get(applicant.reportsToUserId, expectedRole) as { id: number; fullName: string } | undefined;
+      if (direct) return [direct];
+    }
+    if (expectedRole === 'TEAM_LEADER' && applicant.teamId) {
+      const byTeam = db
+        .prepare(`SELECT id, full_name as fullName FROM users WHERE team_id = ? AND role = 'TEAM_LEADER' AND is_active = 1`)
+        .all(applicant.teamId) as { id: number; fullName: string }[];
+      if (byTeam.length > 0) return byTeam;
+    }
+    if (applicant.branchId) {
+      const byBranch = db
+        .prepare(`SELECT id, full_name as fullName FROM users WHERE branch_id = ? AND role = ? AND is_active = 1`)
+        .all(applicant.branchId, expectedRole) as { id: number; fullName: string }[];
+      if (byBranch.length > 0) return byBranch;
+    }
+    return db
+      .prepare(`SELECT id, full_name as fullName FROM users WHERE role = ? AND is_active = 1`)
+      .all(expectedRole) as { id: number; fullName: string }[];
+  };
+
+  const enumerateIsoDates = (fromIso: string, toIso: string): string[] => {
+    const out: string[] = [];
+    const start = new Date(`${fromIso}T00:00:00Z`).getTime();
+    const end = new Date(`${toIso}T00:00:00Z`).getTime();
+    if (Number.isNaN(start) || Number.isNaN(end) || end < start) return out;
+    for (let ts = start; ts <= end && out.length < 60; ts += 86400000) {
+      out.push(new Date(ts).toISOString().slice(0, 10));
+    }
+    return out;
+  };
+
+  router.get('/attendance', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    if (user.role === 'REFERRAL_PARTNER') {
+      res.status(403).json({ error: 'Daily attendance is for company employees only' });
+      return;
+    }
+    const settings = getSettings();
+    const ist = getIstDateTimeParts();
+    const cutoffMins = parseCutoffMinutes(settings.attendanceCutoffTime);
+    const isAfterCutoff = ist.istMinutesOfDay > cutoffMins;
+
+    let where = '';
+    const params: any[] = [];
+    if (user.role === 'FIELD_OFFICER' || user.role === 'LEAD_GENERATOR') {
+      where = 'WHERE a.employee_id = ?';
+      params.push(user.id);
+    } else if (user.role === 'TEAM_LEADER') {
+      where = `WHERE (a.employee_id = ? OR (u.role = 'FIELD_OFFICER' AND (u.reports_to_user_id = ? OR (u.reports_to_user_id IS NULL AND u.team_id = ?))))`;
+      params.push(user.id, user.id, user.teamId || -1);
+    } else if (user.role === 'BRANCH_MANAGER') {
+      where = `WHERE (a.employee_id = ? OR u.reports_to_user_id = ? OR (u.branch_id = ? AND u.role IN ('TEAM_LEADER','FIELD_OFFICER','LEAD_GENERATOR')))`;
+      params.push(user.id, user.id, user.branchId || -1);
+    }
+
+    const records = db
+      .prepare(`
+        SELECT a.id, a.attendance_code as attendanceCode, a.employee_id as employeeId,
+          u.full_name as employeeName, u.employee_code as employeeCode, u.role as employeeRole,
+          a.attendance_date as attendanceDate, a.marked_at as markedAt, a.marked_time_ist as markedTimeIst,
+          a.latitude, a.longitude, a.accuracy, a.location_label as locationLabel,
+          a.distance_meters as distanceMeters, a.within_office as withinOffice,
+          a.auto_captured as autoCaptured, a.status, a.self_approved as selfApproved,
+          a.is_late as isLate, a.delay_minutes as delayMinutes,
+          a.delay_penalty_amount as delayPenaltyAmount, a.penalty_id as penaltyId,
+          a.notes, a.created_at as createdAt
+        FROM attendance_logs a
+        JOIN users u ON u.id = a.employee_id
+        ${where}
+        ORDER BY a.attendance_date DESC, a.marked_at DESC
+        LIMIT 250
+      `)
+      .all(...params)
+      .map((r: any) => ({
+        ...r,
+        withinOffice: Boolean(r.withinOffice),
+        autoCaptured: Boolean(r.autoCaptured),
+        selfApproved: Boolean(r.selfApproved),
+        isLate: Boolean(r.isLate),
+      }));
+
+    const todayRecord =
+      records.find((r: any) => r.employeeId === user.id && r.attendanceDate === ist.istDate) || null;
+
+    // Staff list visible to manager for unapproved leave monitoring
+    let staffWhere = `WHERE u.is_active = 1 AND u.role <> 'REFERRAL_PARTNER'`;
+    const staffParams: any[] = [];
+    if (user.role === 'FIELD_OFFICER' || user.role === 'LEAD_GENERATOR') {
+      staffWhere += ' AND u.id = ?';
+      staffParams.push(user.id);
+    } else if (user.role === 'TEAM_LEADER') {
+      staffWhere += ` AND (u.id = ? OR (u.role = 'FIELD_OFFICER' AND (u.reports_to_user_id = ? OR (u.reports_to_user_id IS NULL AND u.team_id = ?))))`;
+      staffParams.push(user.id, user.id, user.teamId || -1);
+    } else if (user.role === 'BRANCH_MANAGER') {
+      staffWhere += ` AND (u.id = ? OR u.reports_to_user_id = ? OR (u.branch_id = ? AND u.role IN ('TEAM_LEADER','FIELD_OFFICER','LEAD_GENERATOR')))`;
+      staffParams.push(user.id, user.id, user.branchId || -1);
+    }
+    const staff = db
+      .prepare(`
+        SELECT u.id, u.full_name as fullName, u.employee_code as employeeCode, u.role
+        FROM users u
+        ${staffWhere}
+        ORDER BY u.full_name ASC
+      `)
+      .all(...staffParams);
+
+    res.json({
+      records,
+      todayRecord,
+      staff,
+      officeConfig: {
+        officeName: settings.officeName,
+        officeAddress: settings.officeAddress,
+        officeLatitude: settings.officeLatitude,
+        officeLongitude: settings.officeLongitude,
+        officeRadiusMeters: settings.officeRadiusMeters,
+        attendanceCutoffTime: settings.attendanceCutoffTime,
+        attendanceLatePenaltyInr: settings.attendanceLatePenaltyInr,
+        unapprovedLeavePenaltyInr: settings.unapprovedLeavePenaltyInr,
+      },
+      serverIstDate: ist.istDate,
+      serverIstTime: ist.istTimeDisplay,
+      isAfterCutoff,
+    });
+  });
+
+  router.post('/attendance/mark', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    if (user.role === 'REFERRAL_PARTNER') {
+      res.status(403).json({ error: 'Daily attendance is for company employees only' });
       return;
     }
 
-    const run = db.prepare('SELECT * FROM bike_runs WHERE id = ?').get(id) as any;
-    if (!run) {
-      res.status(404).json({ error: 'Bike run not found' });
+    const { latitude, longitude, accuracy, locationLabel, notes } = req.body as {
+      latitude?: number;
+      longitude?: number;
+      accuracy?: number;
+      locationLabel?: string;
+      notes?: string;
+    };
+    if (typeof latitude !== 'number' || typeof longitude !== 'number' || Number.isNaN(latitude) || Number.isNaN(longitude)) {
+      res.status(400).json({ error: 'Auto GPS coordinates (latitude, longitude) are required to mark attendance.' });
       return;
     }
 
-    const finalKm = eligibleKm !== undefined ? Number(eligibleKm) : Number(run.eligible_km);
-    const finalIncentive = decision === 'APPROVED' ? Math.round(finalKm * Number(run.rate_per_km) * 100) / 100 : 0;
+    const settings = getSettings();
+    const officeLat = Number(settings.officeLatitude ?? 24.5819);
+    const officeLng = Number(settings.officeLongitude ?? 80.7921);
+    const radiusMeters = Math.max(50, Number(settings.officeRadiusMeters ?? 500));
+    const distanceMeters = Math.round(haversineKm(latitude, longitude, officeLat, officeLng) * 1000);
+    const rawAccuracy =
+      typeof accuracy === 'number' && !Number.isNaN(accuracy) ? Math.max(0, Math.round(accuracy)) : 0;
+    // Indoor 1st-floor GPS readings often carry ±50m–250m signal jitter; subtract capped device accuracy
+    const accuracyAllowance = Math.min(rawAccuracy, 250);
+    const effectiveDistance = Math.max(0, distanceMeters - accuracyAllowance);
 
-    db.prepare(`
-      UPDATE bike_runs
-      SET eligible_km = ?, incentive_amount = ?, approval_status = ?, reviewed_by = ?, review_remarks = ?, reviewed_at = ?
-      WHERE id = ?
-    `).run(finalKm, finalIncentive, decision, admin.id, remarks || null, nowSql(), id);
+    if (effectiveDistance > radiusMeters) {
+      res.status(403).json({
+        error: `Outside Ambika Office range (${distanceMeters}m away${rawAccuracy > 0 ? `, GPS ±${rawAccuracy}m` : ''}; allowed radius ${radiusMeters}m from ${settings.officeName}). Attendance turns ON only inside Ambika Office GPS.`,
+        distanceMeters,
+        effectiveDistance,
+        radiusMeters,
+      });
+      return;
+    }
 
-    createAlert({
-      userId: run.employee_id,
-      category: 'Field Officer GPS Location Alert',
-      titleEn: `Petrol Incentive ${run.run_code} ${decision}`,
-      titleHi: `पेट्रोल प्रोत्साहन ${run.run_code} ${decision === 'APPROVED' ? 'स्वीकृत' : 'अस्वीकृत'}`,
-      messageEn:
-        decision === 'APPROVED'
-          ? `Approved ${finalKm} km × ₹${run.rate_per_km}/km = ₹${finalIncentive}.`
-          : `Bike run ${run.run_code} rejected. Remarks: ${remarks || 'Discrepancy review'}`,
-      messageHi:
-        decision === 'APPROVED'
-          ? `${finalKm} किमी × ₹${run.rate_per_km}/किमी = ₹${finalIncentive} स्वीकृत।`
-          : `बाइक रन ${run.run_code} अस्वीकृत।`,
+    const ist = getIstDateTimeParts();
+    const existing = db
+      .prepare(`SELECT id, attendance_code as attendanceCode FROM attendance_logs WHERE employee_id = ? AND attendance_date = ?`)
+      .get(user.id, ist.istDate) as { id: number; attendanceCode: string } | undefined;
+    if (existing) {
+      res.status(400).json({ error: `Today's self-attendance (${existing.attendanceCode}) is already approved.` });
+      return;
+    }
+
+    const cutoffMins = parseCutoffMinutes(settings.attendanceCutoffTime);
+    const isLate = ist.istMinutesOfDay > cutoffMins;
+    const delayMinutes = isLate ? ist.istMinutesOfDay - cutoffMins : 0;
+    const latePenaltyAmt = isLate ? Math.max(0, Number(settings.attendanceLatePenaltyInr ?? 20)) : 0;
+    const status = isLate ? 'LATE_PRESENT' : 'PRESENT';
+
+    const now = nowSql();
+    const attCode = `ATT-${ist.istDate.replace(/-/g, '')}-${user.employeeCode}`;
+    const resolvedLabel =
+      (locationLabel || '').trim() ||
+      `${settings.officeName || 'AMBIKA Office'} (${latitude.toFixed(4)}, ${longitude.toFixed(4)})`;
+
+    let penaltyId: number | null = null;
+    if (isLate && latePenaltyAmt > 0) {
+      const penCode = `PEN-LATE-${ist.istDate.replace(/-/g, '')}-${user.id}`;
+      const cutoffDisplay = `${settings.attendanceCutoffTime || '10:00'} IST`;
+      const penInsert = db
+        .prepare(`
+          INSERT INTO penalties (
+            penalty_code, employee_id, penalty_type, event_at, deadline_at, actual_update_at,
+            delay_seconds, amount, approval_status, review_remarks, reviewed_at
+          )
+          VALUES (?, ?, 'ATTENDANCE_LATE_20', ?, ?, ?, ?, ?, 'APPROVED', ?, ?)
+        `)
+        .run(
+          penCode,
+          user.id,
+          now,
+          `${ist.istDate} ${cutoffDisplay}`,
+          now,
+          delayMinutes * 60,
+          latePenaltyAmt,
+          `Auto late attendance penalty (${delayMinutes} mins after ${cutoffDisplay})`,
+          now
+        );
+      penaltyId = Number(penInsert.lastInsertRowid);
+
+      createAlert({
+        userId: user.id,
+        category: 'Attendance & Leave Alert',
+        titleEn: `Late Attendance Delay Penalty (₹${latePenaltyAmt})`,
+        titleHi: `देरी से उपस्थिति जुर्माना (₹${latePenaltyAmt})`,
+        messageEn: `Self-attendance approved at ${ist.istTimeDisplay} (${delayMinutes} min after ${cutoffDisplay}). ₹${latePenaltyAmt} daily delay penalty applied.`,
+        messageHi: `${ist.istTimeDisplay} पर उपस्थिति दर्ज हुई (सुबह 10:00 के बाद ${delayMinutes} मिनट देरी)। ₹${latePenaltyAmt} जुर्माना लागू।`,
+      });
+    }
+
+    const insAtt = db
+      .prepare(`
+        INSERT INTO attendance_logs (
+          attendance_code, employee_id, attendance_date, marked_at, marked_time_ist,
+          latitude, longitude, accuracy, location_label, distance_meters, within_office,
+          auto_captured, status, self_approved, is_late, delay_minutes, delay_penalty_amount, penalty_id, notes
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 1, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        attCode,
+        user.id,
+        ist.istDate,
+        now,
+        ist.istTimeDisplay,
+        latitude,
+        longitude,
+        accuracy ?? null,
+        resolvedLabel,
+        distanceMeters,
+        status,
+        isLate ? 1 : 0,
+        delayMinutes,
+        latePenaltyAmt,
+        penaltyId,
+        notes?.trim() || null
+      );
+
+    logAudit(
+      user,
+      isLate ? 'ATTENDANCE_SELF_APPROVED_LATE' : 'ATTENDANCE_SELF_APPROVED',
+      'ATTENDANCE',
+      attCode,
+      `Date: ${ist.istDate}, Time: ${ist.istTimeDisplay}, Distance: ${distanceMeters}m from office${
+        isLate ? `, Late ${delayMinutes}m -> Penalty ₹${latePenaltyAmt}` : ' (On-Time)'
+      }`
+    );
+
+    pushSseEvent('attendance', {
+      employeeId: user.id,
+      employeeName: user.fullName,
+      employeeCode: user.employeeCode,
+      role: user.role,
+      attendanceDate: ist.istDate,
+      status,
     });
 
-    logAudit(admin, `BIKE_RUN_${decision}`, 'BIKE_RUN', run.run_code, `Eligible ${finalKm} km, Incentive ₹${finalIncentive}`);
-    res.json({ ok: true });
+    res.status(201).json({
+      ok: true,
+      id: insAtt.lastInsertRowid,
+      attendanceCode: attCode,
+      attendanceDate: ist.istDate,
+      markedTimeIst: ist.istTimeDisplay,
+      distanceMeters,
+      status,
+      selfApproved: true,
+      isLate,
+      delayMinutes,
+      delayPenaltyAmount: latePenaltyAmt,
+    });
   });
+
+  router.post(
+    '/attendance/office-location',
+    requireAuth,
+    requireRoles('SUPER_ADMIN', 'BRANCH_MANAGER'),
+    (req: AuthedRequest, res) => {
+      const admin = req.user!;
+      const { officeName, officeAddress, latitude, longitude, radiusMeters } = req.body as {
+        officeName?: string;
+        officeAddress?: string;
+        latitude?: number;
+        longitude?: number;
+        radiusMeters?: number;
+      };
+      if (typeof latitude !== 'number' || typeof longitude !== 'number') {
+        res.status(400).json({ error: 'Valid office latitude and longitude are required' });
+        return;
+      }
+      if (officeName?.trim()) updateSetting('officeName', officeName.trim(), admin.id);
+      if (officeAddress?.trim()) updateSetting('officeAddress', officeAddress.trim(), admin.id);
+      updateSetting('officeLatitude', latitude, admin.id);
+      updateSetting('officeLongitude', longitude, admin.id);
+      if (radiusMeters !== undefined && Number(radiusMeters) >= 50) {
+        updateSetting('officeRadiusMeters', Math.round(Number(radiusMeters)), admin.id);
+      }
+      logAudit(
+        admin,
+        'OFFICE_GEOFENCE_UPDATED',
+        'SETTINGS',
+        'OFFICE_GPS',
+        `Updated Ambika Office GPS to (${latitude.toFixed(5)}, ${longitude.toFixed(5)}), radius ${radiusMeters || getSettings().officeRadiusMeters}m`
+      );
+      broadcastLiveSync(
+        'OFFICE_GPS_UPDATED',
+        `Ambika Office GPS anchored by ${admin.fullName} (Radius ${radiusMeters || getSettings().officeRadiusMeters}m)`,
+        admin
+      );
+      res.json({ ok: true, settings: getSettings() });
+    }
+  );
+
+  router.get('/leaves', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    if (user.role === 'REFERRAL_PARTNER') {
+      res.status(403).json({ error: 'Leave management is for company employees only' });
+      return;
+    }
+
+    let where = '';
+    const params: any[] = [];
+    if (user.role === 'FIELD_OFFICER' || user.role === 'LEAD_GENERATOR') {
+      where = 'WHERE lr.employee_id = ?';
+      params.push(user.id);
+    } else if (user.role === 'TEAM_LEADER') {
+      where = `WHERE (lr.employee_id = ? OR (u.role = 'FIELD_OFFICER' AND (u.reports_to_user_id = ? OR (u.reports_to_user_id IS NULL AND u.team_id = ?))))`;
+      params.push(user.id, user.id, user.teamId || -1);
+    } else if (user.role === 'BRANCH_MANAGER') {
+      where = `WHERE (lr.employee_id = ? OR u.reports_to_user_id = ? OR (u.branch_id = ? AND u.role IN ('TEAM_LEADER','FIELD_OFFICER','LEAD_GENERATOR')))`;
+      params.push(user.id, user.id, user.branchId || -1);
+    }
+
+    const leaves = db
+      .prepare(`
+        SELECT lr.id, lr.leave_code as leaveCode, lr.employee_id as employeeId,
+          u.full_name as employeeName, u.employee_code as employeeCode, u.role as employeeRole,
+          u.branch_id as employeeBranchId, u.team_id as employeeTeamId, u.reports_to_user_id as employeeReportsToUserId,
+          lr.from_date as fromDate, lr.to_date as toDate, lr.total_days as totalDays,
+          lr.leave_type as leaveType, lr.reason, lr.approval_status as approvalStatus,
+          lr.expected_approver_role as expectedApproverRole,
+          lr.reviewed_by as reviewedBy, rev.full_name as reviewedByName,
+          lr.reviewer_role as reviewerRole, lr.review_remarks as reviewRemarks, lr.reviewed_at as reviewedAt,
+          lr.unapproved_penalty_amount as unapprovedPenaltyAmount, lr.penalty_id as penaltyId,
+          lr.created_at as createdAt
+        FROM leave_requests lr
+        JOIN users u ON u.id = lr.employee_id
+        LEFT JOIN users rev ON rev.id = lr.reviewed_by
+        ${where}
+        ORDER BY CASE WHEN lr.approval_status = 'PENDING' THEN 0 ELSE 1 END, lr.created_at DESC
+      `)
+      .all(...params)
+      .map((r: any) => {
+        const expectedRole = getExpectedLeaveApproverRole(r.employeeRole);
+        return {
+          ...r,
+          expectedApproverRole: expectedRole,
+          expectedApproverLabel: getExpectedApproverRoleLabel(expectedRole),
+          canReview: canUserReviewLeave(
+            { id: user.id, role: user.role, branchId: user.branchId ?? null, teamId: user.teamId ?? null },
+            {
+              id: Number(r.employeeId),
+              role: String(r.employeeRole),
+              branchId: r.employeeBranchId ?? null,
+              teamId: r.employeeTeamId ?? null,
+              reportsToUserId: r.employeeReportsToUserId ?? null,
+            }
+          ),
+        };
+      });
+
+    res.json({ leaves });
+  });
+
+  router.post('/leaves', requireAuth, (req: AuthedRequest, res) => {
+    const user = req.user!;
+    if (user.role === 'REFERRAL_PARTNER') {
+      res.status(403).json({ error: 'Only company employees can apply for leave' });
+      return;
+    }
+
+    const { fromDate, toDate, leaveType, reason } = req.body as {
+      fromDate?: string;
+      toDate?: string;
+      leaveType?: string;
+      reason?: string;
+    };
+    if (!fromDate || !toDate || !reason?.trim()) {
+      res.status(400).json({ error: 'From date, To date, and Leave Reason are required' });
+      return;
+    }
+    const dates = enumerateIsoDates(fromDate, toDate);
+    if (dates.length === 0) {
+      res.status(400).json({ error: 'To date must be on or after From date' });
+      return;
+    }
+
+    const totalDays = dates.length;
+    const expectedRole = getExpectedLeaveApproverRole(user.role);
+    const leaveCode = `LVE-${Date.now().toString(36).toUpperCase().slice(-5)}`;
+
+    const inserted = db
+      .prepare(`
+        INSERT INTO leave_requests (
+          leave_code, employee_id, from_date, to_date, total_days, leave_type, reason, expected_approver_role
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .run(
+        leaveCode,
+        user.id,
+        fromDate,
+        toDate,
+        totalDays,
+        (leaveType || 'Casual Leave').trim(),
+        reason.trim(),
+        expectedRole
+      );
+
+    const approvers = resolveExpectedLeaveApprovers({
+      id: user.id,
+      role: user.role,
+      branchId: user.branchId ?? null,
+      teamId: user.teamId ?? null,
+      reportsToUserId: user.reportsToUserId ?? null,
+    });
+    for (const mgr of approvers) {
+      createAlert({
+        userId: mgr.id,
+        category: 'Attendance & Leave Alert',
+        titleEn: `Leave Approval Pending: ${leaveCode}`,
+        titleHi: `अवकाश स्वीकृति लंबित: ${leaveCode}`,
+        messageEn: `${user.fullName} (${user.role.replace(/_/g, ' ')}) requested ${totalDays} day(s) leave (${fromDate} to ${toDate}). Reason: ${reason.trim()}`,
+        messageHi: `${user.fullName} ने ${totalDays} दिन के अवकाश का अनुरोध किया है (${fromDate} से ${toDate})। कारण: ${reason.trim()}`,
+      });
+    }
+
+    logAudit(
+      user,
+      'LEAVE_APPLIED',
+      'LEAVE',
+      leaveCode,
+      `Applied ${totalDays} day(s) (${fromDate} to ${toDate}), Approver: ${expectedRole}, Reason: ${reason.trim()}`
+    );
+
+    res.status(201).json({
+      ok: true,
+      id: inserted.lastInsertRowid,
+      leaveCode,
+      totalDays,
+      expectedApproverRole: expectedRole,
+      expectedApproverLabel: getExpectedApproverRoleLabel(expectedRole),
+    });
+  });
+
+  router.patch(
+    '/leaves/:id/decision',
+    requireAuth,
+    requireRoles('TEAM_LEADER', 'BRANCH_MANAGER', 'SUPER_ADMIN'),
+    (req: AuthedRequest, res) => {
+      const reviewer = req.user!;
+      const id = Number(req.params.id);
+      const { decision, remarks } = req.body as {
+        decision?: 'APPROVED' | 'REJECTED';
+        remarks?: string;
+      };
+      if (!decision || !['APPROVED', 'REJECTED'].includes(decision)) {
+        res.status(400).json({ error: 'Decision must be APPROVED or REJECTED' });
+        return;
+      }
+
+      const leave = db.prepare('SELECT * FROM leave_requests WHERE id = ?').get(id) as any;
+      if (!leave) {
+        res.status(404).json({ error: 'Leave request not found' });
+        return;
+      }
+
+      const empRow = db
+        .prepare(
+          `SELECT id, role, branch_id as branchId, team_id as teamId, reports_to_user_id as reportsToUserId FROM users WHERE id = ?`
+        )
+        .get(leave.employee_id) as
+        | {
+            id: number;
+            role: string;
+            branchId: number | null;
+            teamId: number | null;
+            reportsToUserId: number | null;
+          }
+        | undefined;
+      if (!empRow) {
+        res.status(404).json({ error: 'Applicant employee not found' });
+        return;
+      }
+
+      const expectedRole = getExpectedLeaveApproverRole(empRow.role);
+      const allowed = canUserReviewLeave(
+        {
+          id: reviewer.id,
+          role: reviewer.role,
+          branchId: reviewer.branchId ?? null,
+          teamId: reviewer.teamId ?? null,
+        },
+        empRow
+      );
+      if (!allowed) {
+        const expectedLabel = getExpectedApproverRoleLabel(expectedRole);
+        res.status(403).json({
+          error: `Seniority Approval Rule: ${empRow.role.replace(/_/g, ' ')} leave requests can only be approved or rejected by their ${expectedLabel}.`,
+        });
+        return;
+      }
+
+      const settings = getSettings();
+      const now = nowSql();
+      const ist = getIstDateTimeParts();
+      let penaltyAmt = 0;
+      let penaltyId: number | null = leave.penalty_id || null;
+
+      if (decision === 'REJECTED') {
+        // Without approval leave -> ₹100 per leave penalty charge
+        const perLeaveCharge = Math.max(0, Number(settings.unapprovedLeavePenaltyInr ?? 100));
+        const dates = enumerateIsoDates(leave.from_date, leave.to_date);
+        // Exclude days where employee already marked self-attendance
+        const absentDates = dates.filter((dt) => {
+          const hasAtt = db
+            .prepare(`SELECT id FROM attendance_logs WHERE employee_id = ? AND attendance_date = ?`)
+            .get(leave.employee_id, dt);
+          return !hasAtt;
+        });
+        const chargeableDays = absentDates.length > 0 ? absentDates.length : Number(leave.total_days || 1);
+        penaltyAmt = perLeaveCharge * chargeableDays;
+
+        if (penaltyAmt > 0 && !penaltyId) {
+          const penCode = `PEN-ULV-${leave.leave_code}`;
+          const penIns = db
+            .prepare(`
+              INSERT INTO penalties (
+                penalty_code, employee_id, penalty_type, event_at, deadline_at, actual_update_at,
+                delay_seconds, amount, approval_status, reviewed_by, review_remarks, reviewed_at
+              )
+              VALUES (?, ?, 'UNAPPROVED_LEAVE_100', ?, ?, ?, 0, ?, 'APPROVED', ?, ?, ?)
+            `)
+            .run(
+              penCode,
+              leave.employee_id,
+              now,
+              `${leave.from_date} to ${leave.to_date}`,
+              now,
+              penaltyAmt,
+              reviewer.id,
+              `Unapproved leave penalty (₹${perLeaveCharge} × ${chargeableDays} leave(s)) — ${leave.leave_code}${
+                remarks ? `: ${remarks}` : ''
+              }`,
+              now
+            );
+          penaltyId = Number(penIns.lastInsertRowid);
+        }
+      }
+
+      db.prepare(`
+        UPDATE leave_requests
+        SET approval_status = ?, reviewed_by = ?, reviewer_role = ?, review_remarks = ?, reviewed_at = ?,
+            unapproved_penalty_amount = ?, penalty_id = ?
+        WHERE id = ?
+      `).run(
+        decision,
+        reviewer.id,
+        reviewer.role,
+        remarks?.trim() || null,
+        now,
+        penaltyAmt,
+        penaltyId,
+        id
+      );
+
+      createAlert({
+        userId: leave.employee_id,
+        category: 'Attendance & Leave Alert',
+        titleEn:
+          decision === 'APPROVED'
+            ? `Leave Approved: ${leave.leave_code}`
+            : `Leave Rejected — ₹${penaltyAmt} Unapproved Leave Penalty`,
+        titleHi:
+          decision === 'APPROVED'
+            ? `अवकाश स्वीकृत: ${leave.leave_code}`
+            : `अवकाश अस्वीकृत — ₹${penaltyAmt} बिना स्वीकृति जुर्माना`,
+        messageEn:
+          decision === 'APPROVED'
+            ? `${reviewer.fullName} approved your leave (${leave.from_date} to ${leave.to_date}).${remarks ? ' Remarks: ' + remarks : ''}`
+            : `${reviewer.fullName} rejected your leave (${leave.from_date} to ${leave.to_date}). Without-approval leave penalty of ₹${penaltyAmt} charged.${
+                remarks ? ' Remarks: ' + remarks : ''
+              }`,
+        messageHi:
+          decision === 'APPROVED'
+            ? `${reviewer.fullName} ने आपका अवकाश (${leave.from_date} से ${leave.to_date}) स्वीकृत किया।`
+            : `${reviewer.fullName} ने अवकाश अस्वीकृत किया। ₹${penaltyAmt} जुर्माना लागू।`,
+      });
+
+      logAudit(
+        reviewer,
+        `LEAVE_${decision}`,
+        'LEAVE',
+        leave.leave_code,
+        `Leave ${leave.leave_code} ${decision} by ${reviewer.fullName}${
+          penaltyAmt > 0 ? ` | Unapproved Penalty ₹${penaltyAmt}` : ''
+        }`
+      );
+
+      res.json({
+        ok: true,
+        approvalStatus: decision,
+        unapprovedPenaltyAmount: penaltyAmt,
+        istDate: ist.istDate,
+      });
+    }
+  );
+
+  // Direct Without-Approval Leave Penalty Charge (₹100/leave for any absent staff without attendance or approved leave)
+  router.post(
+    '/attendance/unapproved-leave-penalty',
+    requireAuth,
+    requireRoles('TEAM_LEADER', 'BRANCH_MANAGER', 'SUPER_ADMIN'),
+    (req: AuthedRequest, res) => {
+      const reviewer = req.user!;
+      const { employeeId, leaveDate, remarks } = req.body as {
+        employeeId?: number;
+        leaveDate?: string;
+        remarks?: string;
+      };
+      const targetDate = (leaveDate || getIstDateTimeParts().istDate).trim();
+      if (!employeeId) {
+        res.status(400).json({ error: 'Employee ID is required' });
+        return;
+      }
+
+      const emp = db
+        .prepare(
+          `SELECT id, full_name as fullName, employee_code as employeeCode, role, branch_id as branchId, team_id as teamId, reports_to_user_id as reportsToUserId FROM users WHERE id = ? AND is_active = 1`
+        )
+        .get(Number(employeeId)) as any;
+      if (!emp || emp.role === 'REFERRAL_PARTNER') {
+        res.status(404).json({ error: 'Active employee not found' });
+        return;
+      }
+
+      const allowed = canUserReviewLeave(
+        { id: reviewer.id, role: reviewer.role, branchId: reviewer.branchId ?? null, teamId: reviewer.teamId ?? null },
+        emp
+      );
+      if (!allowed && reviewer.role !== 'SUPER_ADMIN') {
+        const expectedLabel = getExpectedApproverRoleLabel(getExpectedLeaveApproverRole(emp.role));
+        res.status(403).json({
+          error: `Seniority Approval Rule: Only ${emp.fullName}'s ${expectedLabel} or Super Admin can charge unapproved leave penalty.`,
+        });
+        return;
+      }
+
+      const hasAttendance = db
+        .prepare(`SELECT id FROM attendance_logs WHERE employee_id = ? AND attendance_date = ?`)
+        .get(emp.id, targetDate);
+      if (hasAttendance) {
+        res.status(400).json({ error: `${emp.fullName} has marked present attendance on ${targetDate}.` });
+        return;
+      }
+
+      const approvedLeave = db
+        .prepare(`SELECT id, leave_code FROM leave_requests WHERE employee_id = ? AND approval_status = 'APPROVED' AND ? BETWEEN from_date AND to_date`)
+        .get(emp.id, targetDate) as { id: number; leave_code: string } | undefined;
+      if (approvedLeave) {
+        res.status(400).json({ error: `${emp.fullName} has an APPROVED leave (${approvedLeave.leave_code}) on ${targetDate}.` });
+        return;
+      }
+
+      const penCode = `PEN-ABS-${targetDate.replace(/-/g, '')}-${emp.id}`;
+      const existingPen = db.prepare(`SELECT id FROM penalties WHERE penalty_code = ?`).get(penCode);
+      if (existingPen) {
+        res.status(400).json({ error: `Unapproved leave penalty already charged for ${emp.fullName} on ${targetDate}.` });
+        return;
+      }
+
+      const settings = getSettings();
+      const amount = Math.max(0, Number(settings.unapprovedLeavePenaltyInr ?? 100));
+      const now = nowSql();
+
+      const penIns = db
+        .prepare(`
+          INSERT INTO penalties (
+            penalty_code, employee_id, penalty_type, event_at, deadline_at, actual_update_at,
+            delay_seconds, amount, approval_status, reviewed_by, review_remarks, reviewed_at
+          )
+          VALUES (?, ?, 'UNAPPROVED_LEAVE_100', ?, ?, ?, 0, ?, 'APPROVED', ?, ?, ?)
+        `)
+        .run(
+          penCode,
+          emp.id,
+          now,
+          targetDate,
+          now,
+          amount,
+          reviewer.id,
+          remarks?.trim() || `Without-approval leave / absence on ${targetDate} (₹${amount}/leave)`,
+          now
+        );
+
+      createAlert({
+        userId: emp.id,
+        category: 'Attendance & Leave Alert',
+        titleEn: `₹${amount} Unapproved Leave Penalty (${targetDate})`,
+        titleHi: `₹${amount} बिना स्वीकृति अवकाश जुर्माना (${targetDate})`,
+        messageEn: `Absent without approved leave on ${targetDate}. ₹${amount} unapproved leave penalty charged by ${reviewer.fullName}.`,
+        messageHi: `${targetDate} को बिना स्वीकृत अवकाश अनुपस्थिति पर ₹${amount} जुर्माना लगाया गया।`,
+      });
+
+      logAudit(
+        reviewer,
+        'UNAPPROVED_LEAVE_PENALTY',
+        'PENALTY',
+        penCode,
+        `Charged ₹${amount} unapproved leave penalty to ${emp.fullName} (${emp.employeeCode}) for ${targetDate}`
+      );
+
+      res.status(201).json({ ok: true, id: penIns.lastInsertRowid, penaltyCode: penCode, amount });
+    }
+  );
 
   // Alert Centre (Top Header Bell Icon)
   router.get('/alerts', requireAuth, (req: AuthedRequest, res) => {
@@ -4143,6 +5970,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       case 'field_officer_performance': {
         title = type === 'employee_leads' ? 'Employee-wise Lead Report' : 'Field Officer Performance Report';
         columns = ['Emp Code', 'Field Officer', 'Total Leads', 'Disbursed', 'Disbursement (INR)', 'Approved Penalties (INR)'];
+        const isFieldOfficer = user.role === 'FIELD_OFFICER';
         rows = db
           .prepare(`
             SELECT u.employee_code as "Emp Code", u.full_name as "Field Officer",
@@ -4152,10 +5980,10 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
               (SELECT COALESCE(SUM(p.amount), 0) FROM penalties p WHERE p.employee_id = u.id AND p.approval_status = 'APPROVED') as "Approved Penalties (INR)"
             FROM users u
             LEFT JOIN leads l ON l.assigned_officer_id = u.id
-            WHERE u.role = 'FIELD_OFFICER'
+            WHERE u.role = 'FIELD_OFFICER' ${isFieldOfficer ? 'AND u.id = ?' : ''}
             GROUP BY u.id
           `)
-          .all() as any[];
+          .all(...(isFieldOfficer ? [user.id] : [])) as any[];
         break;
       }
       case 'branch_performance': {
@@ -4292,20 +6120,150 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       }
       case 'bike_run':
       case 'petrol_incentive': {
-        title = type === 'bike_run' ? 'Bike Run Distance Report' : 'Petrol Incentive Report';
-        columns = ['Run Code', 'Employee', 'Start', 'End', 'Opening Odo', 'Closing Odo', 'GPS KM', 'Odo KM', 'Rate/KM', 'Incentive (INR)', 'Approval'];
+        title = type === 'bike_run' ? 'Bike Run Distance Report' : 'Weekly Petrol Incentive Bill Report (@ ₹3/km)';
+        let bikeWhere = '';
+        const bikeRepParams: any[] = [];
+        if (user.role === 'FIELD_OFFICER' || user.role === 'LEAD_GENERATOR') {
+          bikeWhere = 'WHERE br.employee_id = ?';
+          bikeRepParams.push(user.id);
+        } else if (user.role === 'TEAM_LEADER') {
+          bikeWhere = `WHERE (br.employee_id = ? OR (u.role = 'FIELD_OFFICER' AND (u.reports_to_user_id = ? OR (u.reports_to_user_id IS NULL AND u.team_id = ?))))`;
+          bikeRepParams.push(user.id, user.id, user.teamId || -1);
+        } else if (user.role === 'BRANCH_MANAGER') {
+          bikeWhere = `WHERE (br.employee_id = ? OR u.reports_to_user_id = ? OR (u.branch_id = ? AND u.role IN ('TEAM_LEADER','FIELD_OFFICER')))`;
+          bikeRepParams.push(user.id, user.id, user.branchId || -1);
+        }
+        columns = [
+          'Run Code',
+          'Employee',
+          'Role',
+          'Start Date/Time',
+          'End Date/Time',
+          'Start Meter',
+          'Close Meter',
+          'GPS Location',
+          'Customer Name',
+          'Reason for Tour',
+          'Total KM',
+          'Rate/KM',
+          'Gross Bill (INR)',
+          'Deducted (INR)',
+          'Net Payable (INR)',
+          'Approval Status',
+          'Reviewed By',
+        ];
         rows = db
           .prepare(`
-            SELECT br.run_code as "Run Code", u.full_name as "Employee", br.start_time as "Start",
-              COALESCE(br.end_time, 'Active') as "End", br.opening_odometer as "Opening Odo",
-              COALESCE(br.closing_odometer, 0) as "Closing Odo", br.gps_distance_km as "GPS KM",
-              br.odometer_distance_km as "Odo KM", br.rate_per_km as "Rate/KM",
-              br.incentive_amount as "Incentive (INR)", br.approval_status as "Approval"
+            SELECT br.run_code as "Run Code", u.full_name as "Employee", u.role as "Role",
+              br.start_time as "Start Date/Time", COALESCE(br.end_time, 'Active') as "End Date/Time",
+              br.opening_odometer as "Start Meter", COALESCE(br.closing_odometer, 0) as "Close Meter",
+              CASE
+                WHEN COALESCE(br.end_location, '') <> '' THEN COALESCE(br.start_location, '') || ' -> ' || br.end_location
+                ELSE COALESCE(br.start_location, printf('%.4f, %.4f', br.start_lat, br.start_lng))
+              END as "GPS Location",
+              COALESCE(NULLIF(br.customer_name, ''), '-') as "Customer Name",
+              COALESCE(NULLIF(br.tour_reason, ''), '-') as "Reason for Tour",
+              br.eligible_km as "Total KM",
+              br.rate_per_km as "Rate/KM",
+              CASE WHEN br.gross_amount > 0 THEN br.gross_amount ELSE ROUND(br.eligible_km * br.rate_per_km, 2) END as "Gross Bill (INR)",
+              COALESCE(br.deducted_amount, 0) as "Deducted (INR)",
+              br.incentive_amount as "Net Payable (INR)",
+              br.approval_status as "Approval Status",
+              COALESCE(rev.full_name, '-') as "Reviewed By"
             FROM bike_runs br
             JOIN users u ON u.id = br.employee_id
+            LEFT JOIN users rev ON rev.id = br.reviewed_by
+            ${bikeWhere}
             ORDER BY br.start_time DESC
           `)
-          .all() as any[];
+          .all(...bikeRepParams) as any[];
+        break;
+      }
+      case 'attendance': {
+        title = 'Daily Self-Attendance & Late Penalty Report';
+        let attWhere = '';
+        const attParams: any[] = [];
+        if (user.role === 'FIELD_OFFICER' || user.role === 'LEAD_GENERATOR') {
+          attWhere = 'WHERE a.employee_id = ?';
+          attParams.push(user.id);
+        } else if (user.role === 'TEAM_LEADER') {
+          attWhere = `WHERE (a.employee_id = ? OR (u.role = 'FIELD_OFFICER' AND (u.reports_to_user_id = ? OR (u.reports_to_user_id IS NULL AND u.team_id = ?))))`;
+          attParams.push(user.id, user.id, user.teamId || -1);
+        } else if (user.role === 'BRANCH_MANAGER') {
+          attWhere = `WHERE (a.employee_id = ? OR u.reports_to_user_id = ? OR (u.branch_id = ? AND u.role IN ('TEAM_LEADER','FIELD_OFFICER','LEAD_GENERATOR')))`;
+          attParams.push(user.id, user.id, user.branchId || -1);
+        }
+        columns = [
+          'Attendance Code',
+          'Employee',
+          'Role',
+          'Date',
+          'Auto Time (IST)',
+          'Auto GPS Location',
+          'Office Distance (m)',
+          'Status',
+          'Self Approved',
+          'Delay (Min)',
+          'Late Penalty (INR)',
+        ];
+        rows = db
+          .prepare(`
+            SELECT a.attendance_code as "Attendance Code", u.full_name as "Employee", u.role as "Role",
+              a.attendance_date as "Date", a.marked_time_ist as "Auto Time (IST)",
+              a.location_label as "Auto GPS Location", a.distance_meters as "Office Distance (m)",
+              a.status as "Status", CASE WHEN a.self_approved = 1 THEN 'Yes' ELSE 'No' END as "Self Approved",
+              a.delay_minutes as "Delay (Min)", a.delay_penalty_amount as "Late Penalty (INR)"
+            FROM attendance_logs a
+            JOIN users u ON u.id = a.employee_id
+            ${attWhere}
+            ORDER BY a.attendance_date DESC, a.marked_at DESC
+          `)
+          .all(...attParams) as any[];
+        break;
+      }
+      case 'leave': {
+        title = 'Leave & Seniority Approval Penalty Report';
+        let lvWhere = '';
+        const lvParams: any[] = [];
+        if (user.role === 'FIELD_OFFICER' || user.role === 'LEAD_GENERATOR') {
+          lvWhere = 'WHERE lr.employee_id = ?';
+          lvParams.push(user.id);
+        } else if (user.role === 'TEAM_LEADER') {
+          lvWhere = `WHERE (lr.employee_id = ? OR (u.role = 'FIELD_OFFICER' AND (u.reports_to_user_id = ? OR (u.reports_to_user_id IS NULL AND u.team_id = ?))))`;
+          lvParams.push(user.id, user.id, user.teamId || -1);
+        } else if (user.role === 'BRANCH_MANAGER') {
+          lvWhere = `WHERE (lr.employee_id = ? OR u.reports_to_user_id = ? OR (u.branch_id = ? AND u.role IN ('TEAM_LEADER','FIELD_OFFICER','LEAD_GENERATOR')))`;
+          lvParams.push(user.id, user.id, user.branchId || -1);
+        }
+        columns = [
+          'Leave Code',
+          'Employee',
+          'Role',
+          'From Date',
+          'To Date',
+          'Days',
+          'Type',
+          'Leave Reason',
+          'Required Approver',
+          'Status',
+          'Reviewed By',
+          'Unapproved Penalty (INR)',
+        ];
+        rows = db
+          .prepare(`
+            SELECT lr.leave_code as "Leave Code", u.full_name as "Employee", u.role as "Role",
+              lr.from_date as "From Date", lr.to_date as "To Date", lr.total_days as "Days",
+              lr.leave_type as "Type", lr.reason as "Leave Reason",
+              lr.expected_approver_role as "Required Approver", lr.approval_status as "Status",
+              COALESCE(rev.full_name, '-') as "Reviewed By",
+              lr.unapproved_penalty_amount as "Unapproved Penalty (INR)"
+            FROM leave_requests lr
+            JOIN users u ON u.id = lr.employee_id
+            LEFT JOIN users rev ON rev.id = lr.reviewed_by
+            ${lvWhere}
+            ORDER BY lr.created_at DESC
+          `)
+          .all(...lvParams) as any[];
         break;
       }
       default:
@@ -4342,6 +6300,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
             u.role, u.branch_id as branchId, b.name as branchName, u.team_id as teamId, t.name as teamName,
             u.reports_to_user_id as reportsToUserId, rep.full_name as reportsToName, rep.employee_code as reportsToCode,
             u.referral_code as referralCode, u.service_city as serviceCity, u.service_pincodes as servicePincodes,
+            u.profile_photo_data_url as profilePhotoDataUrl,
             u.is_active as isActive, u.otp_enabled as otpEnabled,
             u.gps_consent as gpsConsent, u.camera_consent as cameraConsent, u.created_at as createdAt
           FROM users u
@@ -4487,19 +6446,19 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       otpEnabled,
     } = req.body as Record<string, any>;
 
-    const cleanCode = String(employeeCode || '').trim().toUpperCase();
-    const cleanPass = String(password || '');
+    const cleanCode = String(employeeCode || '').trim().replace(/\s+/g, '').toUpperCase();
+    const cleanPass = String(password || '').trim();
     const cleanRole = String(role || 'FIELD_OFFICER') as UserRole;
     const cleanName = String(fullName || cleanCode).trim();
     const cleanMobile = String(mobile || '').trim();
 
     if (!cleanCode || !cleanPass || !VALID_USER_ROLES.includes(cleanRole)) {
-      res.status(400).json({ error: 'Employee ID, Password, and valid Role are required' });
+      res.status(400).json({ error: 'Employee ID, Password (non-empty), and valid Role are required' });
       return;
     }
 
     const existing = db
-      .prepare(`SELECT id FROM users WHERE UPPER(employee_code) = UPPER(?)`)
+      .prepare(`SELECT id FROM users WHERE UPPER(REPLACE(employee_code, ' ', '')) = UPPER(?)`)
       .get(cleanCode);
     if (existing) {
       res.status(409).json({ error: `Employee ID "${cleanCode}" already exists. Use another ID or Auto-Generate.` });
@@ -4557,12 +6516,14 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       }
 
       logAudit(admin, 'USER_CREATED', 'USER', cleanCode, `Created ${cleanRole} login ID ${cleanCode} (${cleanName})`);
+      broadcastLiveSync('HIERARCHY_UPDATED', `New ${cleanRole} ID ${cleanCode} (${cleanName}) added by Admin`, admin);
       res.status(201).json({
         ok: true,
         id: newUserId,
         created: {
           id: newUserId,
           employeeCode: cleanCode,
+          password: cleanPass,
           fullName: cleanName,
           mobile: cleanMobile,
           role: cleanRole,
@@ -4670,7 +6631,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         seq++;
 
         const plainPassword =
-          passwordMode === 'custom' ? String(commonPassword) : generateReadablePassword(8);
+          passwordMode === 'custom' ? String(commonPassword || '').trim() : generateReadablePassword(8);
         const passHash = bcrypt.hashSync(plainPassword, 10);
         const fullName = `${cleanNamePrefix} ${code}`;
         const email = `${code.toLowerCase()}@ambikaassociate.in`;
@@ -4719,6 +6680,11 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       'USER',
       cleanPrefix,
       `Generated ${createdList.length} ${cleanRole} login IDs (${createdList[0]?.employeeCode} .. ${createdList[createdList.length - 1]?.employeeCode})`
+    );
+    broadcastLiveSync(
+      'HIERARCHY_UPDATED',
+      `${createdList.length} new ${cleanRole} IDs (${createdList[0]?.employeeCode}..) created by Admin`,
+      admin
     );
     res.status(201).json({ ok: true, count: createdList.length, created: createdList });
   });
@@ -4816,13 +6782,15 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     }
     if (typeof otpEnabled === 'boolean') db.prepare('UPDATE users SET otp_enabled = ? WHERE id = ?').run(otpEnabled ? 1 : 0, targetId);
     if (newPassword && String(newPassword).trim()) {
-      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(String(newPassword), 10), targetId);
+      const cleanNewPass = String(newPassword).trim();
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(cleanNewPass, 10), targetId);
       logAudit(admin, 'PASSWORD_RESET', 'USER', target.employee_code, `Updated password for login ID ${target.employee_code}`);
     }
 
     if (typeof isActive !== 'boolean' && !newPassword) {
       logAudit(admin, 'USER_UPDATED', 'USER', target.employee_code, `Updated permissions/hierarchy/territory for ${target.full_name}`);
     }
+    broadcastLiveSync('HIERARCHY_UPDATED', `Staff profile/hierarchy updated for ${target.full_name} (${target.employee_code})`, admin);
     res.json({ ok: true });
   });
 
@@ -4928,7 +6896,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         return;
       }
 
-      let cleanCode = String(employeeCode || '').trim().toUpperCase();
+      let cleanCode = String(employeeCode || '').trim().replace(/\s+/g, '').toUpperCase();
       if (!cleanCode) {
         const existingCodes = db
           .prepare(`SELECT employee_code FROM users WHERE UPPER(employee_code) LIKE 'DSA%'`)
@@ -5114,6 +7082,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       state.trim()
     );
     logAudit(req.user!, 'BRANCH_CREATED', 'BRANCH', code, `Created branch ${name}`);
+    broadcastLiveSync('HIERARCHY_UPDATED', `New branch ${name} created by Admin`, req.user!);
     res.status(201).json({ ok: true, id: inserted.lastInsertRowid });
   });
 
@@ -5127,6 +7096,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       .prepare('INSERT INTO teams (branch_id, name, leader_user_id) VALUES (?, ?, ?)')
       .run(Number(branchId), String(name).trim(), leaderUserId ? Number(leaderUserId) : null);
     logAudit(req.user!, 'TEAM_CREATED', 'TEAM', name, `Created team ${name}`);
+    broadcastLiveSync('HIERARCHY_UPDATED', `New team ${name} created by Admin`, req.user!);
     res.status(201).json({ ok: true, id: inserted.lastInsertRowid });
   });
 
@@ -5159,7 +7129,17 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       'autoAssignIncomingLeads',
       'autoAssignMaxActiveLeads',
       'autoAssignGeoWeight',
+      'officeName',
+      'officeAddress',
+      'officeLatitude',
+      'officeLongitude',
+      'officeRadiusMeters',
+      'attendanceCutoffTime',
+      'attendanceLatePenaltyInr',
+      'unapprovedLeavePenaltyInr',
+      'seniorityInstructions',
     ];
+    const changedKeys: string[] = [];
     for (const k of allowedKeys) {
       if (req.body[k] !== undefined) {
         if (k === 'playStoreUrl' || k === 'apkDownloadUrl') {
@@ -5172,9 +7152,37 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         } else {
           updateSetting(k, req.body[k], admin.id);
         }
+        changedKeys.push(k);
       }
     }
-    logAudit(admin, 'SETTINGS_UPDATED', 'SETTINGS', 'SYSTEM', `Updated system settings: ${Object.keys(req.body).join(', ')}`);
+    logAudit(admin, 'SETTINGS_UPDATED', 'SETTINGS', 'SYSTEM', `Updated system settings: ${changedKeys.join(', ')}`);
+
+    if (changedKeys.includes('seniorityInstructions') && String(req.body.seniorityInstructions || '').trim()) {
+      const instructionText = String(req.body.seniorityInstructions).trim();
+      const staffIds = db
+        .prepare(`SELECT id FROM users WHERE is_active = 1 AND role <> 'REFERRAL_PARTNER' AND id <> ?`)
+        .all(admin.id) as Array<{ id: number }>;
+      for (const s of staffIds) {
+        createAlert({
+          userId: s.id,
+          category: 'Admin Seniority Instruction',
+          titleEn: 'New Seniority Instruction from Super Admin',
+          titleHi: 'सुपर एडमिन से नया सीनियरिटी निर्देश',
+          messageEn: instructionText,
+          messageHi: instructionText,
+        });
+      }
+    }
+
+    const summary = changedKeys.includes('companyLogoDataUrl')
+      ? 'Company Logo & Admin Rules synced live'
+      : changedKeys.includes('seniorityInstructions')
+        ? 'Seniority Instructions & Admin Rules synced live'
+        : changedKeys.includes('officeLatitude') || changedKeys.includes('officeAddress')
+          ? 'Office Address / Attendance GPS synced live'
+          : `Admin Panel Rules synced (${changedKeys.length} setting${changedKeys.length === 1 ? '' : 's'})`;
+
+    broadcastLiveSync('SETTINGS_UPDATED', summary, admin);
     res.json({ settings: getSettings() });
   });
 

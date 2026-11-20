@@ -28,6 +28,8 @@ const REPORT_TYPES = [
   { id: 'gps_visit', label: 'GPS Visit Report', referralAllowed: false },
   { id: 'bike_run', label: 'Daily / Weekly / Monthly Bike Run Report', referralAllowed: false },
   { id: 'petrol_incentive', label: 'Petrol Incentive Report', referralAllowed: false },
+  { id: 'attendance', label: 'Daily Self-Attendance & Late Penalty Report', referralAllowed: false },
+  { id: 'leave', label: 'Leave & Seniority Approval Penalty Report', referralAllowed: false },
 ];
 
 export const ReportsModule: React.FC<ReportsModuleProps> = ({

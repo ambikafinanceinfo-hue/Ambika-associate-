@@ -16,6 +16,7 @@ export default defineConfig(() => {
         registerType: 'autoUpdate',
         injectRegister: false,
         includeAssets: [
+          'assets/aistudio/LOGO_AMBIKA_2025_FINAL_a8908f5d.jpg',
           'ambika-logo.png',
           'ambika-logo-banner.png',
           'ambika-logo-white.png',
@@ -37,19 +38,19 @@ export default defineConfig(() => {
           scope: '/',
           icons: [
             {
-              src: '/pwa-192x192.png',
+              src: '/pwa-192x192.png?v=20261120',
               sizes: '192x192',
               type: 'image/png',
               purpose: 'any',
             },
             {
-              src: '/pwa-512x512.png',
+              src: '/pwa-512x512.png?v=20261120',
               sizes: '512x512',
               type: 'image/png',
               purpose: 'any',
             },
             {
-              src: '/pwa-maskable-512x512.png',
+              src: '/pwa-maskable-512x512.png?v=20261120',
               sizes: '512x512',
               type: 'image/png',
               purpose: 'maskable',
@@ -58,7 +59,7 @@ export default defineConfig(() => {
         },
         injectManifest: {
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          globPatterns: ['**/*.{js,css,html,ico,png,jpg,svg,woff,woff2}'],
         },
         devOptions: {
           enabled: true,

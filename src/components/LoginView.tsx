@@ -7,6 +7,7 @@ import { usePWAInstall } from '../lib/usePWAInstall';
 import { AppInstallModal } from './AppInstallModal';
 import { BrandMark } from './BrandMark';
 import { MobileAppPromptBanner } from './MobileAppPromptBanner';
+import { LegalTermsModal, type LegalTab } from './LegalTermsModal';
 
 interface LoginViewProps {
   logoDataUrl: string | null;
@@ -14,19 +15,12 @@ interface LoginViewProps {
   apkDownloadUrl?: string | null;
   hasUploadedApk?: boolean;
   apkFileSize?: number | null;
+  hasUploadedAab?: boolean;
+  aabFileSize?: number | null;
   lang: Lang;
   onToggleLang: () => void;
   onAuthenticated: (user: AuthUser) => void;
 }
-
-const TEST_ACCOUNTS = [
-  { role: 'Super Admin', code: 'ADM001', pass: 'Admin@123', desc: 'Full system, duplicates, penalties, settings & audit' },
-  { role: 'Branch Manager', code: 'BM001', pass: 'Branch@123', desc: 'Branch leads, staff & branch performance reports' },
-  { role: 'Team Leader', code: 'TL001', pass: 'Leader@123', desc: 'Team leads, follow-ups & enquiry escalation' },
-  { role: 'Back Office Lead Gen', code: 'LG001', pass: 'Backoffice@123', desc: 'Generate leads & distribute to Field Officers by Name/ID' },
-  { role: 'Field Officer', code: 'FO001', pass: 'Field@123', desc: 'Assigned leads, KYC camera/docs, GPS & Bike Run' },
-  { role: 'DSA / Referral Partner', code: 'REF001', pass: 'Referral@123', desc: 'Submit leads, view redacted status & raise enquiries' },
-];
 
 export const LoginView: React.FC<LoginViewProps> = ({
   logoDataUrl,
@@ -34,6 +28,8 @@ export const LoginView: React.FC<LoginViewProps> = ({
   apkDownloadUrl,
   hasUploadedApk,
   apkFileSize,
+  hasUploadedAab,
+  aabFileSize,
   lang,
   onToggleLang,
   onAuthenticated,
@@ -44,6 +40,14 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showAppModal, setShowAppModal] = useState(false);
+  const [legalModalTab, setLegalModalTab] = useState<LegalTab | null>(null);
+  const [termsAccepted, setTermsAccepted] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('ambika_terms_accepted_v1') === 'true';
+    } catch {
+      return false;
+    }
+  });
   const { isInstallable, isInstalled, isIOS, isAndroid, install } = usePWAInstall();
 
   const [otpChallenge, setOtpChallenge] = useState<{
@@ -52,16 +56,28 @@ export const LoginView: React.FC<LoginViewProps> = ({
     verificationOtpPreview?: string;
   } | null>(null);
   const [otpCode, setOtpCode] = useState('');
-  const [showTestAccounts, setShowTestAccounts] = useState(true);
 
   const handleLoginSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!termsAccepted) {
+      setError(
+        lang === 'hi'
+          ? 'कृपया साइन इन करने से पहले नियम व शर्तें, गोपनीयता नीति और अनुमति प्रकटीकरण स्वीकार करें।'
+          : 'Please accept the Terms & Conditions, Privacy Policy, and Permission Disclosure before signing in.'
+      );
+      return;
+    }
+    try {
+      localStorage.setItem('ambika_terms_accepted_v1', 'true');
+    } catch {
+      // ignore storage errors
+    }
     setError(null);
     setLoading(true);
     try {
       const res = await apiFetch<any>('/auth/login', {
         method: 'POST',
-        json: { identifier, password },
+        json: { identifier: identifier.trim(), password: password.trim() },
       });
       if (res.requiresOtp) {
         setOtpChallenge({
@@ -138,8 +154,16 @@ export const LoginView: React.FC<LoginViewProps> = ({
         />
       </div>
 
-      <main className="flex-1 max-w-6xl w-full mx-auto px-4 py-6 lg:py-10 grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-        <section className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-6 sm:p-8">
+      <main className="flex-1 max-w-xl w-full mx-auto px-4 py-6 lg:py-10 flex flex-col justify-center">
+        <section className="w-full bg-white border border-slate-200 rounded-xl p-6 sm:p-8 shadow-xs">
+          <div className="mb-5 pb-4 border-b border-slate-100 flex items-center justify-center bg-[#068220]/5 rounded-lg p-2">
+            <img
+              src={logoDataUrl || '/assets/aistudio/LOGO_AMBIKA_2025_FINAL_a8908f5d.jpg?v=20261120'}
+              alt="AMBIKA ASSOCIATE — Smart Finance Smart Saving"
+              referrerPolicy="no-referrer"
+              className="max-h-20 w-auto rounded-md object-contain"
+            />
+          </div>
           <div className="mb-6">
             <p className="text-xs font-semibold tracking-wide text-[#EA580C]">
               {lang === 'hi' ? 'सुरक्षित सीआरएम पोर्टल' : 'SECURE ENTERPRISE CRM PORTAL'}
@@ -177,9 +201,13 @@ export const LoginView: React.FC<LoginViewProps> = ({
                   <input
                     type="text"
                     required
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    autoComplete="username"
+                    spellCheck={false}
                     value={identifier}
                     onChange={(e) => setIdentifier(e.target.value)}
-                    placeholder="e.g. ADM001 or 9800000001"
+                    placeholder="Employee Code, Mobile or Email"
                     className="w-full pl-10 pr-4 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#0F2744]/20 focus:border-[#0F2744]"
                   />
                 </div>
@@ -194,6 +222,10 @@ export const LoginView: React.FC<LoginViewProps> = ({
                   <input
                     type={showPass ? 'text' : 'password'}
                     required
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    autoComplete="current-password"
+                    spellCheck={false}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="Enter password"
@@ -209,6 +241,45 @@ export const LoginView: React.FC<LoginViewProps> = ({
                   </button>
                 </div>
               </div>
+
+              <label className="flex items-start gap-2.5 p-3 rounded-lg bg-slate-50 border border-slate-200 cursor-pointer text-xs text-slate-600 leading-relaxed">
+                <input
+                  type="checkbox"
+                  checked={termsAccepted}
+                  onChange={(e) => {
+                    setTermsAccepted(e.target.checked);
+                    if (e.target.checked) setError(null);
+                  }}
+                  className="mt-0.5 rounded border-slate-300 text-[#0F2744] focus:ring-[#0F2744]"
+                />
+                <span>
+                  {lang === 'hi' ? 'मैं ' : 'I accept the '}
+                  <button
+                    type="button"
+                    onClick={() => setLegalModalTab('terms')}
+                    className="font-semibold text-[#0F2744] underline hover:text-[#EA580C]"
+                  >
+                    Terms &amp; Conditions
+                  </button>
+                  {', '}
+                  <button
+                    type="button"
+                    onClick={() => setLegalModalTab('privacy')}
+                    className="font-semibold text-[#0F2744] underline hover:text-[#EA580C]"
+                  >
+                    Privacy Policy
+                  </button>
+                  {' & '}
+                  <button
+                    type="button"
+                    onClick={() => setLegalModalTab('permissions')}
+                    className="font-semibold text-[#0F2744] underline hover:text-[#EA580C]"
+                  >
+                    Location/Camera/Audio Disclosure
+                  </button>
+                  {lang === 'hi' ? ' स्वीकार करता हूँ।' : '.'}
+                </span>
+              </label>
 
               <button
                 type="submit"
@@ -277,9 +348,9 @@ export const LoginView: React.FC<LoginViewProps> = ({
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex flex-wrap items-center justify-between gap-3">
                 <div className="flex items-center gap-2.5 min-w-0">
                   <img
-                    src="/pwa-192x192.png"
+                    src="/pwa-192x192.png?v=20261120"
                     alt="AMBIKA ASSOCIATE App Icon"
-                    className="w-9 h-9 rounded-lg border border-slate-200 object-cover shrink-0 bg-[#0F2744]"
+                    className="w-9 h-9 rounded-lg border border-yellow-400/50 object-cover shrink-0 bg-[#068220]"
                   />
                   <div className="min-w-0">
                     <div className="text-xs font-semibold text-[#0F2744] truncate">
@@ -312,62 +383,43 @@ export const LoginView: React.FC<LoginViewProps> = ({
             )}
           </div>
         </section>
+      </main>
 
-        <section className="lg:col-span-6 bg-white border border-slate-200 rounded-xl p-6 sm:p-8">
-          <div className="flex items-center justify-between gap-4 mb-4">
-            <div>
-              <h2 className="text-base font-display font-bold text-[#0F2744]">
-                {lang === 'hi' ? 'भूमिका परीक्षण खाते (Role Verification)' : 'Role Verification Test Accounts'}
-              </h2>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Click any account below to pre-fill credentials and test server-enforced permissions.
-              </p>
-            </div>
+      <footer className="border-t border-slate-200 bg-white px-4 py-4">
+        <div className="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
+          <span>© {new Date().getFullYear()} AMBIKA ASSOCIATE · Smart Finance Smart Saving</span>
+          <div className="flex flex-wrap items-center gap-4">
             <button
               type="button"
-              onClick={() => setShowTestAccounts(!showTestAccounts)}
-              className="text-xs font-semibold text-[#0F2744] hover:underline whitespace-nowrap shrink-0"
+              onClick={() => setLegalModalTab('privacy')}
+              className="hover:text-[#0F2744] font-medium underline"
             >
-              {showTestAccounts ? 'Hide' : 'Show'}
+              Privacy Policy
+            </button>
+            <button
+              type="button"
+              onClick={() => setLegalModalTab('terms')}
+              className="hover:text-[#0F2744] font-medium underline"
+            >
+              Terms &amp; Conditions
+            </button>
+            <button
+              type="button"
+              onClick={() => setLegalModalTab('permissions')}
+              className="hover:text-[#0F2744] font-medium underline"
+            >
+              Permission Disclosure
+            </button>
+            <button
+              type="button"
+              onClick={() => setLegalModalTab('deletion')}
+              className="hover:text-[#0F2744] font-medium underline"
+            >
+              Account &amp; Data Deletion
             </button>
           </div>
-
-          {showTestAccounts && (
-            <div className="divide-y divide-slate-200 border border-slate-200 rounded-lg overflow-hidden">
-              {TEST_ACCOUNTS.map((acc) => (
-                <button
-                  key={acc.code}
-                  type="button"
-                  onClick={() => {
-                    setIdentifier(acc.code);
-                    setPassword(acc.pass);
-                    setError(null);
-                  }}
-                  className="w-full text-left px-4 py-3 hover:bg-slate-50 transition-colors flex items-center justify-between gap-4"
-                >
-                  <div className="min-w-0">
-                    <div className="text-sm font-semibold text-[#0F2744]">{acc.role}</div>
-                    <div className="text-xs text-slate-500 mt-0.5 truncate">{acc.desc}</div>
-                  </div>
-                  <div className="text-right shrink-0 font-mono text-xs">
-                    <div className="font-semibold text-slate-800">{acc.code}</div>
-                    <div className="text-slate-500">{acc.pass}</div>
-                  </div>
-                </button>
-              ))}
-            </div>
-          )}
-
-          <div className="mt-5 p-4 rounded-lg bg-slate-50 border border-slate-200 text-xs text-slate-600 space-y-1.5">
-            <div className="font-semibold text-[#0F2744]">Important Referral Privacy Verification</div>
-            <p>
-              Sign in as <span className="font-mono font-semibold">REF001</span> to confirm that Customer Mobile,
-              Address, PAN, Loan Amount, KYC Documents, Internal Remarks, and other partners&apos; enquiries are
-              strictly redacted by the backend API.
-            </p>
-          </div>
-        </section>
-      </main>
+        </div>
+      </footer>
 
       {showAppModal && (
         <AppInstallModal
@@ -382,7 +434,27 @@ export const LoginView: React.FC<LoginViewProps> = ({
           apkDownloadUrl={apkDownloadUrl}
           hasUploadedApk={hasUploadedApk}
           apkFileSize={apkFileSize}
+          hasUploadedAab={hasUploadedAab}
+          aabFileSize={aabFileSize}
           onClose={() => setShowAppModal(false)}
+        />
+      )}
+
+      {legalModalTab && (
+        <LegalTermsModal
+          lang={lang}
+          initialTab={legalModalTab}
+          onAccept={() => {
+            setTermsAccepted(true);
+            try {
+              localStorage.setItem('ambika_terms_accepted_v1', 'true');
+            } catch {
+              // ignore
+            }
+            setError(null);
+            setLegalModalTab(null);
+          }}
+          onClose={() => setLegalModalTab(null)}
         />
       )}
     </div>

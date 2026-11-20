@@ -5,6 +5,11 @@ import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { initDatabase } from './server/db.ts';
 import { createApiRouter } from './server/routes.ts';
+import {
+  renderAccountDeletionHtml,
+  renderPrivacyPolicyHtml,
+  renderTermsHtml,
+} from './server/legalPages.ts';
 import { processSlaTimers } from './server/slaEngine.ts';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -25,6 +30,42 @@ async function startServer() {
   const app = express();
   const httpServer = http.createServer(app);
 
+  // Google Play Console required public legal pages (HTTP 200 standalone HTML)
+  app.get('/privacy-policy', (_req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(renderPrivacyPolicyHtml());
+  });
+  app.get('/terms-and-conditions', (_req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(renderTermsHtml());
+  });
+  app.get('/account-deletion', (_req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(renderAccountDeletionHtml());
+  });
+
+  // Prevent stale caching of PWA shell, Service Worker, Manifest, APIs & Official Logo icons
+  app.use((req, res, next) => {
+    const p = req.path;
+    if (
+      p === '/' ||
+      p === '/index.html' ||
+      p === '/sw.js' ||
+      p === '/registerSW.js' ||
+      p === '/manifest.webmanifest' ||
+      p.startsWith('/api/')
+    ) {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    } else if (
+      /^\/(pwa-|apple-touch-icon|ambika-logo|icon\.svg|assets\/aistudio\/)/.test(p)
+    ) {
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+    }
+    next();
+  });
+
   app.use('/api', createApiRouter());
 
   if (process.env.NODE_ENV !== 'production') {
@@ -41,8 +82,24 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
+    app.use(
+      express.static(distPath, {
+        etag: true,
+        setHeaders(res, filePath) {
+          if (
+            filePath.endsWith('.html') ||
+            filePath.endsWith('sw.js') ||
+            filePath.endsWith('registerSW.js') ||
+            filePath.endsWith('.webmanifest') ||
+            /ambika-logo|pwa-|apple-touch-icon|icon\.svg|LOGO_AMBIKA/i.test(filePath)
+          ) {
+            res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+          }
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
