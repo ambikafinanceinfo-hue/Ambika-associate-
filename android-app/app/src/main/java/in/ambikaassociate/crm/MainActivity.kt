@@ -20,10 +20,12 @@ import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
@@ -51,12 +53,17 @@ class MainActivity : AppCompatActivity() {
     private var pendingGeoOrigin: String? = null
     private var pendingGeoCallback: GeolocationPermissions.Callback? = null
 
-    private val baseUrl: String
-        get() = BuildConfig.CRM_BASE_URL.trimEnd('/')
-
     private val prefs by lazy {
         getSharedPreferences("ambika_crm_prefs", Context.MODE_PRIVATE)
     }
+
+    private val baseUrl: String
+        get() {
+            val saved = prefs.getString("custom_crm_base_url", null)?.trim().orEmpty()
+            return if (saved.startsWith("https://")) saved.trimEnd('/') else BuildConfig.CRM_BASE_URL.trimEnd('/')
+        }
+
+    private lateinit var offlineMessageView: TextView
 
     private val fileChooserLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -159,13 +166,14 @@ class MainActivity : AppCompatActivity() {
                 setTextColor(0xFF0F2744.toInt())
                 setTypeface(typeface, android.graphics.Typeface.BOLD)
             })
-            addView(TextView(this@MainActivity).apply {
-                text = "Unable to reach the CRM server. Please check mobile data / Wi-Fi and try again."
+            offlineMessageView = TextView(this@MainActivity).apply {
+                text = "Unable to reach the CRM server. Please check mobile data / Wi-Fi, or switch to your live Deployed / Dev Server URL below."
                 textSize = 14f
                 setTextColor(0xFF475569.toInt())
-                setPadding(0, 24, 0, 36)
+                setPadding(0, 24, 0, 32)
                 gravity = android.view.Gravity.CENTER
-            })
+            }
+            addView(offlineMessageView)
             addView(Button(this@MainActivity).apply {
                 text = "Retry Connection"
                 setBackgroundColor(0xFF15803D.toInt())
@@ -174,6 +182,19 @@ class MainActivity : AppCompatActivity() {
                     offlineOverlay.visibility = View.GONE
                     webView.visibility = View.VISIBLE
                     webView.loadUrl(baseUrl)
+                }
+            })
+            addView(Button(this@MainActivity).apply {
+                text = "Change / Set Live Server URL"
+                setBackgroundColor(0xFF0F2744.toInt())
+                setTextColor(0xFFFFFFFF.toInt())
+                val lp = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = 24 }
+                layoutParams = lp
+                setOnClickListener {
+                    showServerUrlDialog()
                 }
             })
         }
@@ -248,6 +269,44 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun showServerUrlDialog() {
+        val input = EditText(this).apply {
+            setText(baseUrl)
+            hint = "https://your-live-app-url.run.app"
+            setSingleLine(true)
+            setPadding(36, 28, 36, 28)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Configure CRM Server URL")
+            .setMessage("Paste your Published / Deployed HTTPS CRM URL, or tap 'Use Shared URL' / 'Use Dev URL'.")
+            .setView(input)
+            .setPositiveButton("Save & Open") { _, _ ->
+                val entered = input.text.toString().trim().trimEnd('/')
+                if (entered.startsWith("https://")) {
+                    prefs.edit().putString("custom_crm_base_url", entered).apply()
+                    offlineOverlay.visibility = View.GONE
+                    webView.visibility = View.VISIBLE
+                    webView.loadUrl(entered)
+                } else {
+                    Toast.makeText(this, "URL must start with https://", Toast.LENGTH_LONG).show()
+                }
+            }
+            .setNeutralButton("Use Dev URL") { _, _ ->
+                val devUrl = BuildConfig.CRM_DEV_URL.trimEnd('/')
+                prefs.edit().putString("custom_crm_base_url", devUrl).apply()
+                offlineOverlay.visibility = View.GONE
+                webView.visibility = View.VISIBLE
+                webView.loadUrl(devUrl)
+            }
+            .setNegativeButton("Reset Shared URL") { _, _ ->
+                prefs.edit().remove("custom_crm_base_url").apply()
+                offlineOverlay.visibility = View.GONE
+                webView.visibility = View.VISIBLE
+                webView.loadUrl(BuildConfig.CRM_BASE_URL.trimEnd('/'))
+            }
+            .show()
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun configureWebView() {
         val cookieManager = CookieManager.getInstance()
@@ -315,6 +374,22 @@ class MainActivity : AppCompatActivity() {
                 if (request?.isForMainFrame == true) {
                     progressBar.visibility = View.GONE
                     webView.visibility = View.GONE
+                    offlineMessageView.text =
+                        "Unable to reach:\n$baseUrl\n\nCheck internet connection or tap 'Change / Set Live Server URL' below."
+                    offlineOverlay.visibility = View.VISIBLE
+                }
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                errorResponse: WebResourceResponse?
+            ) {
+                if (request?.isForMainFrame == true && (errorResponse?.statusCode == 404 || errorResponse?.statusCode == 502 || errorResponse?.statusCode == 503)) {
+                    progressBar.visibility = View.GONE
+                    webView.visibility = View.GONE
+                    offlineMessageView.text =
+                        "Server URL returned HTTP ${errorResponse.statusCode}:\n$baseUrl\n\nIf you have not published the Shared URL yet, tap 'Change / Set Live Server URL' below to enter your Deployed URL or switch to Dev URL."
                     offlineOverlay.visibility = View.VISIBLE
                 }
             }

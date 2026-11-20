@@ -37,6 +37,11 @@ android {
             "CRM_BASE_URL",
             "\"https://ais-pre-qjijuhugfbwl3m7542cfsq-916287731082.asia-southeast1.run.app\""
         )
+        buildConfigField(
+            "String",
+            "CRM_DEV_URL",
+            "\"https://ais-dev-qjijuhugfbwl3m7542cfsq-916287731082.asia-southeast1.run.app\""
+        )
     }
 
     signingConfigs {

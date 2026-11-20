@@ -89,16 +89,46 @@ async function startServer() {
   app.use('/api', createApiRouter());
 
   if (process.env.NODE_ENV !== 'production') {
+    const hmrDisabled = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: {
-          server: httpServer,
-        },
-        watch: process.env.DISABLE_HMR === 'true' ? null : undefined,
+        hmr: hmrDisabled ? false : { server: httpServer },
+        watch: hmrDisabled ? null : undefined,
       },
       appType: 'spa',
     });
+
+    // Guard Vite 8 @vite/client against WebSocket errors when HMR is disabled/closed
+    app.get('/@vite/client', async (_req, res, next) => {
+      try {
+        const result = await vite.transformRequest('/@vite/client');
+        if (!result?.code) {
+          next();
+          return;
+        }
+        let safeCode = result.code
+          .replace(
+            /ws\.send\(JSON\.stringify\(data\)\)/g,
+            'if (ws && ws.readyState === 1) ws.send(JSON.stringify(data))'
+          )
+          .replace(/wsTransport\.send\(data\)/g, 'wsTransport?.send(data)');
+
+        if (hmrDisabled) {
+          safeCode = safeCode.replace(
+            /const transport = normalizeModuleRunnerTransport\(\(\(\) => \{[\s\S]*?\}\)\(\)\);/,
+            'const transport = normalizeModuleRunnerTransport({ async connect() {}, async disconnect() {}, send() {} });'
+          );
+        }
+
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(safeCode);
+      } catch {
+        next();
+      }
+    });
+
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
