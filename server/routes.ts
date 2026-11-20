@@ -6701,6 +6701,8 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     const admin = req.user!;
     const targetId = Number(req.params.id);
     const {
+      employeeCode,
+      referralCode,
       fullName,
       mobile,
       role,
@@ -6725,6 +6727,51 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       return;
     }
 
+    let renamedEmpCode: string | null = null;
+    if (employeeCode !== undefined) {
+      const cleanNewCode = String(employeeCode || '').trim().replace(/\s+/g, '').toUpperCase();
+      if (!cleanNewCode || !/^[A-Z0-9_-]{2,32}$/.test(cleanNewCode)) {
+        res.status(400).json({
+          error: 'Employee ID must be 2–32 characters using letters, numbers, "-" or "_" (no spaces).',
+        });
+        return;
+      }
+      if (cleanNewCode.toUpperCase() !== String(target.employee_code || '').toUpperCase()) {
+        const dupCode = db
+          .prepare(`SELECT id FROM users WHERE UPPER(REPLACE(employee_code, ' ', '')) = UPPER(?) AND id != ?`)
+          .get(cleanNewCode, targetId);
+        if (dupCode) {
+          res.status(409).json({ error: `Employee ID "${cleanNewCode}" already exists. Choose a different ID.` });
+          return;
+        }
+        renamedEmpCode = cleanNewCode;
+      }
+    }
+
+    let renamedRefCode: string | null | undefined = undefined;
+    if (referralCode !== undefined) {
+      const cleanNewRef = String(referralCode || '').trim().replace(/\s+/g, '').toUpperCase();
+      if (cleanNewRef && !/^[A-Z0-9_-]{2,36}$/.test(cleanNewRef)) {
+        res.status(400).json({
+          error: 'Referral Code must be 2–36 characters using letters, numbers, "-" or "_" (no spaces).',
+        });
+        return;
+      }
+      const oldRef = String(target.referral_code || '').toUpperCase();
+      if (cleanNewRef !== oldRef) {
+        if (cleanNewRef) {
+          const dupRef = db
+            .prepare(`SELECT id FROM users WHERE UPPER(REPLACE(referral_code, ' ', '')) = UPPER(?) AND id != ?`)
+            .get(cleanNewRef, targetId);
+          if (dupRef) {
+            res.status(409).json({ error: `Referral Code "${cleanNewRef}" already exists. Choose another code.` });
+            return;
+          }
+        }
+        renamedRefCode = cleanNewRef || null;
+      }
+    }
+
     const nextRole = role !== undefined && VALID_USER_ROLES.includes(role) ? (role as UserRole) : (target.role as UserRole);
     const nextParentId =
       reportsToUserId !== undefined ? (reportsToUserId ? Number(reportsToUserId) : null) : target.reports_to_user_id;
@@ -6747,6 +6794,41 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       if ((nextRole === 'FIELD_OFFICER' || nextRole === 'REFERRAL_PARTNER') && hierCheck.teamId) {
         syncedTeamId = hierCheck.teamId;
       }
+    }
+
+    if (renamedEmpCode) {
+      const oldEmpCode = String(target.employee_code || '');
+      db.prepare('UPDATE users SET employee_code = ? WHERE id = ?').run(renamedEmpCode, targetId);
+      const expectedAutoEmail = `${oldEmpCode.toLowerCase()}@ambikaassociate.in`;
+      if (String(target.email || '').toLowerCase() === expectedAutoEmail) {
+        const nextAutoEmail = `${renamedEmpCode.toLowerCase()}@ambikaassociate.in`;
+        const emailConflict = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?) AND id != ?').get(nextAutoEmail, targetId);
+        if (!emailConflict) {
+          db.prepare('UPDATE users SET email = ? WHERE id = ?').run(nextAutoEmail, targetId);
+        }
+      }
+      logAudit(
+        admin,
+        'USER_ID_RENAMED',
+        'USER',
+        renamedEmpCode,
+        `Renamed Employee ID from ${oldEmpCode} to ${renamedEmpCode} (${target.full_name})`
+      );
+    }
+
+    if (renamedRefCode !== undefined) {
+      const oldRefCode = target.referral_code ? String(target.referral_code) : null;
+      db.prepare('UPDATE users SET referral_code = ? WHERE id = ?').run(renamedRefCode, targetId);
+      if (oldRefCode && renamedRefCode) {
+        db.prepare('UPDATE leads SET referral_id = ? WHERE UPPER(referral_id) = UPPER(?)').run(renamedRefCode, oldRefCode);
+      }
+      logAudit(
+        admin,
+        'REFERRAL_CODE_RENAMED',
+        'USER',
+        renamedEmpCode || target.employee_code,
+        `Renamed Referral Code from ${oldRefCode || 'none'} to ${renamedRefCode || 'none'} (${target.full_name})`
+      );
     }
 
     if (fullName !== undefined && String(fullName).trim()) {
@@ -6776,7 +6858,6 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     if (typeof isActive === 'boolean') {
       db.prepare('UPDATE users SET is_active = ? WHERE id = ?').run(isActive ? 1 : 0, targetId);
       if (!isActive) {
-        // Immediately terminate all active sessions and pending OTPs for turned-OFF login ID
         db.prepare('DELETE FROM sessions WHERE user_id = ?').run(targetId);
         db.prepare('DELETE FROM otp_challenges WHERE user_id = ?').run(targetId);
       }
@@ -6784,22 +6865,44 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         admin,
         isActive ? 'LOGIN_ID_ON' : 'LOGIN_ID_OFF',
         'USER',
-        target.employee_code,
-        `${isActive ? 'Turned ON' : 'Turned OFF'} login ID ${target.employee_code} (${target.full_name})`
+        renamedEmpCode || target.employee_code,
+        `${isActive ? 'Turned ON' : 'Turned OFF'} login ID ${renamedEmpCode || target.employee_code} (${target.full_name})`
       );
     }
     if (typeof otpEnabled === 'boolean') db.prepare('UPDATE users SET otp_enabled = ? WHERE id = ?').run(otpEnabled ? 1 : 0, targetId);
     if (newPassword && String(newPassword).trim()) {
       const cleanNewPass = String(newPassword).trim();
       db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(cleanNewPass, 10), targetId);
-      logAudit(admin, 'PASSWORD_RESET', 'USER', target.employee_code, `Updated password for login ID ${target.employee_code}`);
+      logAudit(
+        admin,
+        'PASSWORD_RESET',
+        'USER',
+        renamedEmpCode || target.employee_code,
+        `Updated password for login ID ${renamedEmpCode || target.employee_code}`
+      );
     }
 
-    if (typeof isActive !== 'boolean' && !newPassword) {
-      logAudit(admin, 'USER_UPDATED', 'USER', target.employee_code, `Updated permissions/hierarchy/territory for ${target.full_name}`);
+    if (typeof isActive !== 'boolean' && !newPassword && !renamedEmpCode && renamedRefCode === undefined) {
+      logAudit(
+        admin,
+        'USER_UPDATED',
+        'USER',
+        renamedEmpCode || target.employee_code,
+        `Updated permissions/hierarchy/territory for ${target.full_name}`
+      );
     }
-    broadcastLiveSync('HIERARCHY_UPDATED', `Staff profile/hierarchy updated for ${target.full_name} (${target.employee_code})`, admin);
-    res.json({ ok: true });
+    broadcastLiveSync(
+      'HIERARCHY_UPDATED',
+      renamedEmpCode
+        ? `Employee ID renamed to ${renamedEmpCode} (${target.full_name})`
+        : `Staff profile/hierarchy updated for ${target.full_name} (${renamedEmpCode || target.employee_code})`,
+      admin
+    );
+    res.json({
+      ok: true,
+      employeeCode: renamedEmpCode || target.employee_code,
+      referralCode: renamedRefCode !== undefined ? renamedRefCode : target.referral_code,
+    });
   });
 
   // Referral ID Creation & Management Console
@@ -6857,6 +6960,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         maxReferralsPerFo: HIERARCHY_LIMITS.REFERRALS_PER_FO,
         permissions: {
           canCreate: true,
+          canRename: true,
           canChangeFieldOfficer: !isFO,
           canRemove: !isFO,
         },
@@ -6936,9 +7040,9 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       }
 
       const cleanPassword = String(password || '').trim() || generateReadablePassword(8);
-      const cleanRefCode = String(referralCode || `DSA-${cleanCode}`).trim().toUpperCase();
+      const cleanRefCode = String(referralCode || `DSA-${cleanCode}`).trim().replace(/\s+/g, '').toUpperCase();
       const dupRef = db
-        .prepare(`SELECT id FROM users WHERE UPPER(referral_code) = UPPER(?)`)
+        .prepare(`SELECT id FROM users WHERE UPPER(REPLACE(referral_code, ' ', '')) = UPPER(?)`)
         .get(cleanRefCode);
       if (dupRef) {
         res.status(409).json({ error: `Referral Code "${cleanRefCode}" already exists.` });
@@ -6975,6 +7079,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         cleanCode,
         `Created Referral ID ${cleanCode} (${cleanName}) linked to Field Officer ${foInfo?.full_name} (${foInfo?.employee_code})`
       );
+      broadcastLiveSync('HIERARCHY_UPDATED', `New Referral ID ${cleanCode} (${cleanRefCode}) created`, user);
 
       res.status(201).json({
         ok: true,
@@ -6989,6 +7094,103 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
           assignedFieldOfficerName: foInfo?.full_name ?? '',
           assignedFieldOfficerCode: foInfo?.employee_code ?? '',
         },
+      });
+    }
+  );
+
+  // Rename Referral Partner Login ID & Referral Code (Admin, Back Office, or owning Field Officer)
+  router.patch(
+    '/referrals/manage/:id/rename',
+    requireAuth,
+    requireRoles('SUPER_ADMIN', 'LEAD_GENERATOR', 'FIELD_OFFICER'),
+    (req: AuthedRequest, res) => {
+      const user = req.user!;
+      const referralId = Number(req.params.id);
+      const { employeeCode, referralCode, fullName } = req.body as {
+        employeeCode?: string;
+        referralCode?: string;
+        fullName?: string;
+      };
+
+      const refUser = db
+        .prepare(`SELECT * FROM users WHERE id = ? AND role = 'REFERRAL_PARTNER' AND is_active = 1`)
+        .get(referralId) as any;
+      if (!refUser) {
+        res.status(404).json({ error: 'Active Referral ID not found' });
+        return;
+      }
+      if (user.role === 'FIELD_OFFICER' && Number(refUser.reports_to_user_id) !== user.id) {
+        res.status(403).json({ error: 'You can only rename Referral IDs assigned under your Field Officer ID.' });
+        return;
+      }
+
+      const cleanNewCode =
+        employeeCode !== undefined
+          ? String(employeeCode || '').trim().replace(/\s+/g, '').toUpperCase()
+          : String(refUser.employee_code || '').toUpperCase();
+      if (!cleanNewCode || !/^[A-Z0-9_-]{2,32}$/.test(cleanNewCode)) {
+        res.status(400).json({
+          error: 'Login ID must be 2–32 characters using letters, numbers, "-" or "_" (no spaces).',
+        });
+        return;
+      }
+
+      const cleanNewRef =
+        referralCode !== undefined
+          ? String(referralCode || '').trim().replace(/\s+/g, '').toUpperCase()
+          : String(refUser.referral_code || `DSA-${cleanNewCode}`).toUpperCase();
+      if (!cleanNewRef || !/^[A-Z0-9_-]{2,36}$/.test(cleanNewRef)) {
+        res.status(400).json({
+          error: 'Referral Code must be 2–36 characters using letters, numbers, "-" or "_" (no spaces).',
+        });
+        return;
+      }
+
+      const dupCode = db
+        .prepare(`SELECT id FROM users WHERE UPPER(REPLACE(employee_code, ' ', '')) = UPPER(?) AND id != ?`)
+        .get(cleanNewCode, referralId);
+      if (dupCode) {
+        res.status(409).json({ error: `Login ID "${cleanNewCode}" already exists. Choose a different ID.` });
+        return;
+      }
+
+      const dupRef = db
+        .prepare(`SELECT id FROM users WHERE UPPER(REPLACE(referral_code, ' ', '')) = UPPER(?) AND id != ?`)
+        .get(cleanNewRef, referralId);
+      if (dupRef) {
+        res.status(409).json({ error: `Referral Code "${cleanNewRef}" already exists. Choose a different code.` });
+        return;
+      }
+
+      const oldCode = String(refUser.employee_code || '');
+      const oldRef = String(refUser.referral_code || '');
+      const nextName = fullName && String(fullName).trim() ? String(fullName).trim() : refUser.full_name;
+
+      db.prepare(`UPDATE users SET employee_code = ?, referral_code = ?, full_name = ? WHERE id = ?`).run(
+        cleanNewCode,
+        cleanNewRef,
+        nextName,
+        referralId
+      );
+
+      if (oldRef && oldRef.toUpperCase() !== cleanNewRef.toUpperCase()) {
+        db.prepare(`UPDATE leads SET referral_id = ? WHERE UPPER(referral_id) = UPPER(?)`).run(cleanNewRef, oldRef);
+      }
+
+      logAudit(
+        user,
+        'REFERRAL_ID_RENAMED',
+        'USER',
+        cleanNewCode,
+        `Renamed Referral ID ${oldCode}/${oldRef} -> ${cleanNewCode}/${cleanNewRef} (${nextName})`
+      );
+      broadcastLiveSync('HIERARCHY_UPDATED', `Referral ID renamed to ${cleanNewCode} (${cleanNewRef})`, user);
+
+      res.json({
+        ok: true,
+        employeeCode: cleanNewCode,
+        referralCode: cleanNewRef,
+        fullName: nextName,
       });
     }
   );

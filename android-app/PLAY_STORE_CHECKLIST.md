@@ -5,6 +5,7 @@
 - **Target SDK:** Android 15 (`targetSdk = 35`, `compileSdk = 35`, `minSdk = 24`)
 - **Version:** `2.2.0` (`versionCode = 10003`)
 - **Registered Office:** 1st Floor, Anupam Complex, Pateri Road, Near Reliance Bazar, Satna, MP (485001)
+- **Official Support & Publish Email:** `ambikafinance.info@gmail.com` (Grievance: `rajadineshgupta0@gmail.com`)
 
 ---
 

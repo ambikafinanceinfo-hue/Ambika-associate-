@@ -147,8 +147,8 @@ export const LegalTermsModal: React.FC<LegalTermsModalProps> = ({
                 <li><strong>Super Admin / Back Office Console:</strong> Instant account deactivation or Referral ID removal.</li>
                 <li>
                   <strong>Email Request:</strong> Send your Employee/Referral Code to{' '}
-                  <span className="font-mono font-semibold">rajadineshgupta0@gmail.com</span> or{' '}
-                  <span className="font-mono font-semibold">support@ambikaassociate.in</span>.
+                  <span className="font-mono font-semibold">ambikafinance.info@gmail.com</span> or{' '}
+                  <span className="font-mono font-semibold">rajadineshgupta0@gmail.com</span>.
                 </li>
               </ul>
               <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 font-mono text-[11px]">

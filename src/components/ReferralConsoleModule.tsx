@@ -4,6 +4,7 @@ import {
   Copy,
   Download,
   KeyRound,
+  Pencil,
   Search,
   Sparkles,
   Trash2,
@@ -72,6 +73,7 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
   const [fieldOfficers, setFieldOfficers] = useState<FoQuotaItem[]>([]);
   const [permissions, setPermissions] = useState({
     canCreate: true,
+    canRename: true,
     canChangeFieldOfficer: !isFieldOfficer,
     canRemove: !isFieldOfficer,
   });
@@ -97,11 +99,22 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
   const [createdCreds, setCreatedCreds] = useState<CreatedCred[]>([]);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  // Back Office / Admin-only inline states (never shown to FO)
+  // Inline edit states
+  const [renamingId, setRenamingId] = useState<number | null>(null);
+  const [renameDraft, setRenameDraft] = useState({ employeeCode: '', referralCode: '' });
   const [editingFoId, setEditingFoId] = useState<number | null>(null);
   const [selectedNewFoId, setSelectedNewFoId] = useState<string>('');
   const [confirmRemoveId, setConfirmRemoveId] = useState<number | null>(null);
   const [busyRowId, setBusyRowId] = useState<number | null>(null);
+
+  const suggestNextReferralLoginId = (): string => {
+    let maxSeq = 0;
+    for (const r of referrals) {
+      const m = String(r.employeeCode || '').match(/^DSA(\d+)$/i);
+      if (m && m[1]) maxSeq = Math.max(maxSeq, Number.parseInt(m[1], 10));
+    }
+    return `DSA${String(maxSeq + 1).padStart(3, '0')}`;
+  };
 
   const loadData = async () => {
     setLoading(true);
@@ -110,12 +123,17 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
         referrals: ManagedReferral[];
         fieldOfficers: FoQuotaItem[];
         maxReferralsPerFo: number;
-        permissions: { canCreate: boolean; canChangeFieldOfficer: boolean; canRemove: boolean };
+        permissions: { canCreate: boolean; canRename?: boolean; canChangeFieldOfficer: boolean; canRemove: boolean };
       }>('/referrals/manage');
       setReferrals(res.referrals);
       setFieldOfficers(res.fieldOfficers);
       setMaxPerFo(res.maxReferralsPerFo || HIERARCHY_LIMITS.REFERRALS_PER_FO);
-      setPermissions(res.permissions);
+      setPermissions({
+        canCreate: res.permissions.canCreate,
+        canRename: res.permissions.canRename ?? true,
+        canChangeFieldOfficer: res.permissions.canChangeFieldOfficer,
+        canRemove: res.permissions.canRemove,
+      });
       if (isFieldOfficer) {
         setForm((prev) => ({ ...prev, assignedFieldOfficerId: String(user.id) }));
       } else {
@@ -239,6 +257,37 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
       setErrMsg(err.message || 'Could not create Referral ID');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleRenameReferral = async (referral: ManagedReferral) => {
+    const cleanCode = renameDraft.employeeCode.trim().replace(/\s+/g, '').toUpperCase();
+    const cleanRef = renameDraft.referralCode.trim().replace(/\s+/g, '').toUpperCase();
+    if (!cleanCode || !cleanRef) {
+      setErrMsg('Both Login ID and Referral Code are required (no spaces).');
+      return;
+    }
+    setMsg(null);
+    setErrMsg(null);
+    setBusyRowId(referral.id);
+    try {
+      await apiFetch(`/referrals/manage/${referral.id}/rename`, {
+        method: 'PATCH',
+        json: {
+          employeeCode: cleanCode,
+          referralCode: cleanRef,
+        },
+      });
+      setRenamingId(null);
+      setRenameDraft({ employeeCode: '', referralCode: '' });
+      setMsg(
+        `Referral ID renamed: ${referral.employeeCode} → ${cleanCode} (Referral Code: ${cleanRef}).`
+      );
+      await loadData();
+    } catch (err: any) {
+      setErrMsg(err.message || 'Could not rename Referral ID');
+    } finally {
+      setBusyRowId(null);
     }
   };
 
@@ -469,18 +518,73 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
             )}
 
             <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="text-[11px] font-semibold text-slate-700">Login ID (Optional Auto)</label>
-                <span className="text-[10px] text-slate-400 inline-flex items-center gap-0.5">
-                  <Sparkles className="w-3 h-3 text-[#EA580C]" />
-                  Auto DSA###
-                </span>
+              <div className="flex items-center justify-between gap-1 mb-1">
+                <label className="text-[11px] font-semibold text-slate-700">Login ID (Manual / Auto)</label>
+                <div className="inline-flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setForm((prev) => ({ ...prev, employeeCode: '' }))}
+                    className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-[#0F2744] hover:underline"
+                  >
+                    <Pencil className="w-2.5 h-2.5" />
+                    Manual
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const nextId = suggestNextReferralLoginId();
+                      setForm((prev) => ({
+                        ...prev,
+                        employeeCode: nextId,
+                        referralCode: prev.referralCode || `DSA-${nextId}`,
+                      }));
+                    }}
+                    className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-[#EA580C] hover:underline"
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    Auto ID
+                  </button>
+                </div>
               </div>
               <input
                 type="text"
+                autoCapitalize="characters"
+                autoCorrect="off"
+                spellCheck={false}
                 value={form.employeeCode}
-                onChange={(e) => setForm({ ...form, employeeCode: e.target.value.toUpperCase() })}
-                placeholder="Leave blank for Auto ID"
+                onChange={(e) =>
+                  setForm({ ...form, employeeCode: e.target.value.replace(/\s+/g, '').toUpperCase() })
+                }
+                placeholder="Type manual ID or leave blank for Auto"
+                className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
+              />
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between gap-1 mb-1">
+                <label className="text-[11px] font-semibold text-slate-700">Referral Code (Manual / Auto)</label>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const base = form.employeeCode.trim().replace(/\s+/g, '').toUpperCase() || suggestNextReferralLoginId();
+                    setForm((prev) => ({ ...prev, referralCode: `DSA-${base}` }));
+                  }}
+                  className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-[#EA580C] hover:underline"
+                >
+                  <Sparkles className="w-3 h-3" />
+                  Auto Code
+                </button>
+              </div>
+              <input
+                type="text"
+                autoCapitalize="characters"
+                autoCorrect="off"
+                spellCheck={false}
+                value={form.referralCode}
+                onChange={(e) =>
+                  setForm({ ...form, referralCode: e.target.value.replace(/\s+/g, '').toUpperCase() })
+                }
+                placeholder="e.g. DSA-SATNA01 (or Auto)"
                 className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
               />
             </div>
@@ -500,6 +604,10 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
               <input
                 type="text"
                 required
+                autoCapitalize="none"
+                autoCorrect="off"
+                autoComplete="new-password"
+                spellCheck={false}
                 value={form.password}
                 onChange={(e) => setForm({ ...form, password: e.target.value })}
                 className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
@@ -512,7 +620,7 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
                 type="text"
                 value={form.serviceCity}
                 onChange={(e) => setForm({ ...form, serviceCity: e.target.value })}
-                placeholder="e.g. Mumbai"
+                placeholder="e.g. Satna"
                 className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg"
               />
             </div>
@@ -624,8 +732,8 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
                 <th className="text-left px-4 py-3 font-semibold">Assigned Field Officer</th>
                 <th className="text-left px-4 py-3 font-semibold">Branch / City</th>
                 <th className="text-left px-4 py-3 font-semibold">Created</th>
-                {(permissions.canChangeFieldOfficer || permissions.canRemove) && (
-                  <th className="text-right px-4 py-3 font-semibold">Back Office / Admin Actions</th>
+                {(permissions.canRename || permissions.canChangeFieldOfficer || permissions.canRemove) && (
+                  <th className="text-right px-4 py-3 font-semibold">Actions</th>
                 )}
               </tr>
             </thead>
@@ -705,14 +813,33 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
                     <td className="px-4 py-3 text-[11px] text-slate-500 whitespace-nowrap">
                       {formatDateTime(r.createdAt)}
                     </td>
-                    {(permissions.canChangeFieldOfficer || permissions.canRemove) && (
-                      <td className="px-4 py-3 text-right whitespace-nowrap">
+                    {(permissions.canRename || permissions.canChangeFieldOfficer || permissions.canRemove) && (
+                      <td className="px-4 py-3 text-right whitespace-nowrap space-y-1.5">
                         <div className="inline-flex items-center gap-1.5">
+                          {permissions.canRename && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setConfirmRemoveId(null);
+                                setEditingFoId(null);
+                                setRenamingId(r.id);
+                                setRenameDraft({
+                                  employeeCode: r.employeeCode || '',
+                                  referralCode: r.referralCode || '',
+                                });
+                              }}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-orange-300 bg-orange-50/70 hover:bg-[#EA580C] hover:text-white text-[11px] font-semibold text-[#C2410C] transition-colors"
+                            >
+                              <Pencil className="w-3 h-3" />
+                              Rename ID
+                            </button>
+                          )}
                           {permissions.canChangeFieldOfficer && (
                             <button
                               type="button"
                               onClick={() => {
                                 setConfirmRemoveId(null);
+                                setRenamingId(null);
                                 setEditingFoId(r.id);
                                 setSelectedNewFoId(r.assignedFieldOfficerId ? String(r.assignedFieldOfficerId) : '');
                               }}
@@ -746,6 +873,7 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
                                 type="button"
                                 onClick={() => {
                                   setEditingFoId(null);
+                                  setRenamingId(null);
                                   setConfirmRemoveId(r.id);
                                 }}
                                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-red-200 bg-red-50 hover:bg-[#DC2626] hover:text-white text-[11px] font-semibold text-[#DC2626] transition-colors"
@@ -756,6 +884,58 @@ export const ReferralConsoleModule: React.FC<ReferralConsoleProps> = ({ user, la
                             )
                           )}
                         </div>
+                        {renamingId === r.id && (
+                          <div className="flex flex-wrap items-center justify-end gap-1.5 pt-1">
+                            <input
+                              type="text"
+                              autoCapitalize="characters"
+                              autoCorrect="off"
+                              spellCheck={false}
+                              value={renameDraft.employeeCode}
+                              onChange={(e) =>
+                                setRenameDraft((prev) => ({
+                                  ...prev,
+                                  employeeCode: e.target.value.replace(/\s+/g, '').toUpperCase(),
+                                }))
+                              }
+                              placeholder="New Login ID"
+                              className="w-32 px-2 py-1 text-[11px] font-mono border border-orange-300 rounded bg-white"
+                            />
+                            <input
+                              type="text"
+                              autoCapitalize="characters"
+                              autoCorrect="off"
+                              spellCheck={false}
+                              value={renameDraft.referralCode}
+                              onChange={(e) =>
+                                setRenameDraft((prev) => ({
+                                  ...prev,
+                                  referralCode: e.target.value.replace(/\s+/g, '').toUpperCase(),
+                                }))
+                              }
+                              placeholder="New Ref Code"
+                              className="w-36 px-2 py-1 text-[11px] font-mono border border-orange-300 rounded bg-white"
+                            />
+                            <button
+                              type="button"
+                              disabled={busyRowId === r.id}
+                              onClick={() => handleRenameReferral(r)}
+                              className="px-2.5 py-1 rounded bg-[#EA580C] text-white text-[10px] font-semibold disabled:opacity-50"
+                            >
+                              {busyRowId === r.id ? 'Saving...' : 'Save ID'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setRenamingId(null);
+                                setRenameDraft({ employeeCode: '', referralCode: '' });
+                              }}
+                              className="px-2 py-1 rounded border border-slate-300 text-[10px] text-slate-600"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        )}
                       </td>
                     )}
                   </tr>

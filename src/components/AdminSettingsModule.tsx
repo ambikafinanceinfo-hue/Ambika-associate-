@@ -16,6 +16,7 @@ import {
   Search,
   ShieldCheck,
   Users,
+  Pencil,
 } from 'lucide-react';
 import {
   HIERARCHY_LIMITS,
@@ -132,6 +133,9 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ON' | 'OFF'>('ALL');
   const [resetPasswordUserId, setResetPasswordUserId] = useState<number | null>(null);
   const [resetPasswordDraft, setResetPasswordDraft] = useState('');
+  const [renamingUserId, setRenamingUserId] = useState<number | null>(null);
+  const [renameDraft, setRenameDraft] = useState({ employeeCode: '', referralCode: '' });
+  const [savingRename, setSavingRename] = useState(false);
   const [togglingUserId, setTogglingUserId] = useState<number | null>(null);
 
   const [editingTerritoryId, setEditingTerritoryId] = useState<number | null>(null);
@@ -471,6 +475,41 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
     }
   };
 
+  const handleRenameUserId = async (target: any) => {
+    if (!isSuperAdmin) return;
+    const cleanCode = renameDraft.employeeCode.trim().replace(/\s+/g, '').toUpperCase();
+    const cleanRef = renameDraft.referralCode.trim().replace(/\s+/g, '').toUpperCase();
+    if (!cleanCode || cleanCode.length < 2) {
+      setErrorMsg('Please enter a valid Employee ID (at least 2 characters, no spaces).');
+      return;
+    }
+    setMsg(null);
+    setErrorMsg(null);
+    setSavingRename(true);
+    try {
+      const payload: Record<string, any> = { employeeCode: cleanCode };
+      if (target.role === 'REFERRAL_PARTNER' || target.referralCode || cleanRef) {
+        payload.referralCode = cleanRef;
+      }
+      await apiFetch(`/admin/users/${target.id}`, {
+        method: 'PATCH',
+        json: payload,
+      });
+      setRenamingUserId(null);
+      setRenameDraft({ employeeCode: '', referralCode: '' });
+      setMsg(
+        `ID renamed successfully: ${target.employeeCode} → ${cleanCode}${
+          payload.referralCode ? ` (Referral Code: ${payload.referralCode})` : ''
+        }.`
+      );
+      await loadAll();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Could not rename Employee / Referral ID');
+    } finally {
+      setSavingRename(false);
+    }
+  };
+
   const toggleUserOtp = async (target: any) => {
     if (!isSuperAdmin) return;
     setMsg(null);
@@ -803,21 +842,34 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                 <form onSubmit={handleCreateUser} className="space-y-3">
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                     <div>
-                      <div className="flex items-center justify-between mb-1">
+                      <div className="flex items-center justify-between gap-1 mb-1">
                         <label className="text-[11px] font-semibold text-slate-700">Employee Login ID *</label>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setNewUser((prev) => ({
-                              ...prev,
-                              employeeCode: suggestNextEmployeeCode(prev.role, users),
-                            }))
-                          }
-                          className="inline-flex items-center gap-1 text-[10px] font-semibold text-[#EA580C] hover:underline"
-                        >
-                          <Sparkles className="w-3 h-3" />
-                          Auto ID
-                        </button>
+                        <div className="inline-flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setNewUser((prev) => ({ ...prev, employeeCode: '' }));
+                              window.requestAnimationFrame(() => employeeCodeInputRef.current?.focus());
+                            }}
+                            className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-[#0F2744] hover:underline"
+                          >
+                            <Pencil className="w-2.5 h-2.5" />
+                            Manual
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setNewUser((prev) => ({
+                                ...prev,
+                                employeeCode: suggestNextEmployeeCode(prev.role, users),
+                              }))
+                            }
+                            className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-[#EA580C] hover:underline"
+                          >
+                            <Sparkles className="w-3 h-3" />
+                            Auto ID
+                          </button>
+                        </div>
                       </div>
                       <input
                         ref={employeeCodeInputRef}
@@ -833,7 +885,7 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                             employeeCode: e.target.value.replace(/\s+/g, '').toUpperCase(),
                           })
                         }
-                        placeholder="e.g. FO004 or TLPALAKGUPTA"
+                        placeholder="Type manual ID (e.g. BM_SATNA1) or click Auto ID"
                         className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
                       />
                     </div>
@@ -989,14 +1041,35 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                     </div>
 
                     <div>
-                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                        Referral Code (if DSA)
-                      </label>
+                      <div className="flex items-center justify-between gap-1 mb-1">
+                        <label className="text-[11px] font-semibold text-slate-700">
+                          Referral Code (Manual / Auto)
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const base = newUser.employeeCode.trim().replace(/\s+/g, '').toUpperCase() || suggestNextEmployeeCode('REFERRAL_PARTNER', users);
+                            setNewUser((prev) => ({ ...prev, referralCode: `DSA-${base}` }));
+                          }}
+                          className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-[#EA580C] hover:underline"
+                        >
+                          <Sparkles className="w-3 h-3" />
+                          Auto Ref
+                        </button>
+                      </div>
                       <input
                         type="text"
+                        autoCapitalize="characters"
+                        autoCorrect="off"
+                        spellCheck={false}
                         value={newUser.referralCode}
-                        onChange={(e) => setNewUser({ ...newUser, referralCode: e.target.value.toUpperCase() })}
-                        placeholder="Optional DSA code"
+                        onChange={(e) =>
+                          setNewUser({
+                            ...newUser,
+                            referralCode: e.target.value.replace(/\s+/g, '').toUpperCase(),
+                          })
+                        }
+                        placeholder="Manual code (e.g. DSA-SATNA01)"
                         className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
                       />
                     </div>
@@ -1371,7 +1444,14 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                       u.role === 'LEAD_GENERATOR' ? 'Back Office Team' : u.role.replace('_', ' ');
                     return (
                       <tr key={u.id} className={!u.isActive ? 'bg-red-50/30' : undefined}>
-                        <td className="px-4 py-3 font-mono font-semibold text-[#0F2744]">{u.employeeCode}</td>
+                        <td className="px-4 py-3 font-mono font-semibold text-[#0F2744]">
+                          <div>{u.employeeCode}</div>
+                          {u.referralCode && (
+                            <div className="text-[10px] font-mono font-semibold text-[#EA580C] mt-0.5">
+                              Ref: {u.referralCode}
+                            </div>
+                          )}
+                        </td>
                         <td className="px-4 py-3">
                           <div className="font-semibold text-slate-900">{u.fullName}</div>
                           <div className="font-mono text-[11px] text-slate-500">{u.mobile || 'No mobile set'}</div>
@@ -1484,6 +1564,22 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                               <button
                                 type="button"
                                 onClick={() => {
+                                  setResetPasswordUserId(null);
+                                  setRenamingUserId(u.id);
+                                  setRenameDraft({
+                                    employeeCode: u.employeeCode || '',
+                                    referralCode: u.referralCode || '',
+                                  });
+                                }}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-orange-300 bg-orange-50/70 text-[11px] font-semibold text-[#C2410C] hover:bg-[#EA580C] hover:text-white transition-colors"
+                              >
+                                <Pencil className="w-3 h-3" />
+                                Rename ID
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setRenamingUserId(null);
                                   setResetPasswordUserId(u.id);
                                   setResetPasswordDraft(generateClientPassword(8));
                                 }}
@@ -1507,6 +1603,60 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                                 {isSelf ? 'Current Admin' : u.isActive ? 'Turn OFF ID' : 'Turn ON ID'}
                               </button>
                             </div>
+                            {renamingUserId === u.id && (
+                              <div className="flex flex-wrap items-center justify-end gap-1.5 pt-1">
+                                <input
+                                  type="text"
+                                  autoCapitalize="characters"
+                                  autoCorrect="off"
+                                  spellCheck={false}
+                                  value={renameDraft.employeeCode}
+                                  onChange={(e) =>
+                                    setRenameDraft((prev) => ({
+                                      ...prev,
+                                      employeeCode: e.target.value.replace(/\s+/g, '').toUpperCase(),
+                                    }))
+                                  }
+                                  placeholder="New Employee ID"
+                                  className="w-36 px-2 py-1 text-[11px] font-mono border border-orange-300 rounded bg-white"
+                                />
+                                {(u.role === 'REFERRAL_PARTNER' || u.referralCode) && (
+                                  <input
+                                    type="text"
+                                    autoCapitalize="characters"
+                                    autoCorrect="off"
+                                    spellCheck={false}
+                                    value={renameDraft.referralCode}
+                                    onChange={(e) =>
+                                      setRenameDraft((prev) => ({
+                                        ...prev,
+                                        referralCode: e.target.value.replace(/\s+/g, '').toUpperCase(),
+                                      }))
+                                    }
+                                    placeholder="New Referral Code"
+                                    className="w-36 px-2 py-1 text-[11px] font-mono border border-orange-300 rounded bg-white"
+                                  />
+                                )}
+                                <button
+                                  type="button"
+                                  disabled={savingRename}
+                                  onClick={() => handleRenameUserId(u)}
+                                  className="px-2.5 py-1 rounded bg-[#EA580C] text-white text-[10px] font-semibold disabled:opacity-50"
+                                >
+                                  {savingRename ? 'Saving...' : 'Save ID'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setRenamingUserId(null);
+                                    setRenameDraft({ employeeCode: '', referralCode: '' });
+                                  }}
+                                  className="px-2 py-1 rounded border border-slate-300 text-[10px] text-slate-600"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            )}
                             {resetPasswordUserId === u.id && (
                               <div className="flex items-center justify-end gap-1.5 pt-1">
                                 <input

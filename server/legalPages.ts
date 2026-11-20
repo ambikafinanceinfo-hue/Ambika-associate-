@@ -4,7 +4,7 @@ export const LEGAL_META = {
   appName: 'AMBIKA ASSOCIATE CRM',
   packageId: 'in.ambikaassociate.crm',
   officeAddress: '1st Floor, Anupam Complex, Pateri Road, Near Reliance Bazar, Satna, Madhya Pradesh – 485001, India',
-  supportEmail: 'support@ambikaassociate.in',
+  supportEmail: 'ambikafinance.info@gmail.com',
   grievanceEmail: 'rajadineshgupta0@gmail.com',
   effectiveDate: '2026-11-20',
 };

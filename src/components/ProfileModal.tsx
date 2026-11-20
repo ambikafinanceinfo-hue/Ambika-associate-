@@ -269,6 +269,13 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                 {officeAddress?.trim() || DEFAULT_OFFICE_ADDRESS}
               </div>
             )}
+            <div className="pt-1 border-t border-slate-200/80 flex items-center gap-1.5 text-[11px] text-slate-600">
+              <Mail className="w-3.5 h-3.5 text-[#0F2744] shrink-0" />
+              <span>
+                {lang === 'hi' ? 'आधिकारिक ऐप व अपडेट ईमेल:' : 'Official App & Update Email:'}{' '}
+                <strong className="font-mono text-[#0F2744]">ambikafinance.info@gmail.com</strong>
+              </span>
+            </div>
           </div>
 
           {/* Editable Name, Mobile, Email */}

@@ -809,7 +809,7 @@ function seedInitialOrgAndSettings() {
     const backofficeHash = bcrypt.hashSync('Backoffice@123', 10);
     const refHash = bcrypt.hashSync('Referral@123', 10);
 
-    insertUser.run('ADM001', 'Ruchi Gupta', '9800000001', 'admin@ambikaassociate.in', adminHash, 'SUPER_ADMIN', b1, null, null);
+    insertUser.run('ADM001', 'Ruchi Gupta', '9800000001', 'ambikafinance.info@gmail.com', adminHash, 'SUPER_ADMIN', b1, null, null);
     insertUser.run('BM001', 'Vikram Patel', '9800000002', 'vikram.bm@ambikaassociate.in', branchHash, 'BRANCH_MANAGER', b1, null, null);
     const tlId = insertUser.run('TL001', 'Neha Kulkarni', '9800000003', 'neha.tl@ambikaassociate.in', leaderHash, 'TEAM_LEADER', b1, t1, null).lastInsertRowid as number;
     db.prepare('UPDATE teams SET leader_user_id = ? WHERE id = ?').run(tlId, t1);
@@ -1270,6 +1270,13 @@ export function seedSalesExtensionsIfNeeded() {
       VALUES ('TLPALAKGUPTA', 'Palak Gupta', '', 'tlpalakgupta@ambikaassociate.in', ?, 'BRANCH_MANAGER', ?, NULL, NULL, 1, 0, 1, 1)
     `).run(palakHash, b1?.id ?? null);
   }
+
+  // Sync Super Admin ADM001 placeholder email to official publish/update email ambikafinance.info@gmail.com
+  db.prepare(`
+    UPDATE users
+    SET email = 'ambikafinance.info@gmail.com'
+    WHERE UPPER(employee_code) = 'ADM001' AND LOWER(email) = 'admin@ambikaassociate.in'
+  `).run();
 
   const monthKey = new Date().toISOString().slice(0, 7);
   const targetCount = (db.prepare(`SELECT COUNT(*) as c FROM sales_targets WHERE month_key = ?`).get(monthKey) as { c: number }).c;
