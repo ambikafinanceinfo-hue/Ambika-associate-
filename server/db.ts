@@ -890,13 +890,25 @@ export function getSettings(): SystemSettings {
   const autoDefault = DEFAULT_LOAN_PRODUCTS.find((d) => d.id === 'auto_loan')!;
   const loanProducts = hasAutoLoan ? normalizedProducts : [...normalizedProducts, autoDefault];
 
-  const hostedApkPath = path.join(UPLOAD_DIR, 'ambika-associate-crm.apk');
-  const hasUploadedApk = fs.existsSync(hostedApkPath);
-  const apkFileSize = hasUploadedApk ? fs.statSync(hostedApkPath).size : null;
+  const uploadedApkPath = path.join(UPLOAD_DIR, 'ambika-associate-crm.apk');
+  const bundledApkPath = path.join(process.cwd(), 'public', 'ambika-associate-crm.apk');
+  const hostedApkPath = fs.existsSync(uploadedApkPath)
+    ? uploadedApkPath
+    : fs.existsSync(bundledApkPath)
+      ? bundledApkPath
+      : null;
+  const hasUploadedApk = Boolean(hostedApkPath);
+  const apkFileSize = hostedApkPath ? fs.statSync(hostedApkPath).size : null;
 
-  const hostedAabPath = path.join(UPLOAD_DIR, 'ambika-associate-crm.aab');
-  const hasUploadedAab = fs.existsSync(hostedAabPath);
-  const aabFileSize = hasUploadedAab ? fs.statSync(hostedAabPath).size : null;
+  const uploadedAabPath = path.join(UPLOAD_DIR, 'ambika-associate-crm.aab');
+  const bundledAabPath = path.join(process.cwd(), 'public', 'ambika-associate-crm.aab');
+  const hostedAabPath = fs.existsSync(uploadedAabPath)
+    ? uploadedAabPath
+    : fs.existsSync(bundledAabPath)
+      ? bundledAabPath
+      : null;
+  const hasUploadedAab = Boolean(hostedAabPath);
+  const aabFileSize = hostedAabPath ? fs.statSync(hostedAabPath).size : null;
 
   return {
     petrolRatePerKm: Number(map.petrolRatePerKm ?? 3.0),

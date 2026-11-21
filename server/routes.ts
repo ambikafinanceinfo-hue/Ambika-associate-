@@ -961,11 +961,19 @@ export function createApiRouter() {
     });
   };
 
-  // Download Direct Android APK (serves Admin-uploaded .apk, external apkDownloadUrl, or live-configured APK Build Kit)
+  // Download Direct Android APK (serves Admin-uploaded or bundled .apk, external apkDownloadUrl, or live-configured APK Build Kit)
   router.get('/public/download-apk', (req, res) => {
-    const apkPath = path.join(UPLOADS_PATH, 'ambika-associate-crm.apk');
-    if (fs.existsSync(apkPath)) {
+    const uploadedApkPath = path.join(UPLOADS_PATH, 'ambika-associate-crm.apk');
+    const bundledApkPath = path.join(process.cwd(), 'public', 'ambika-associate-crm.apk');
+    const apkPath = fs.existsSync(uploadedApkPath)
+      ? uploadedApkPath
+      : fs.existsSync(bundledApkPath)
+        ? bundledApkPath
+        : null;
+    if (apkPath) {
+      const stat = fs.statSync(apkPath);
       res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+      res.setHeader('Content-Length', String(stat.size));
       res.setHeader('Content-Disposition', 'attachment; filename="ambika-associate-crm.apk"');
       fs.createReadStream(apkPath).pipe(res);
       return;
@@ -983,11 +991,19 @@ export function createApiRouter() {
   // Downloadable Android Studio Kotlin + Play Store AAB/APK Build Kit (live origin injected)
   router.get('/public/android-app-kit', streamPatchedAndroidKit);
 
-  // Download Play Store .aab bundle (if uploaded by Admin), otherwise streams Play Store Build Kit
+  // Download Play Store .aab bundle (if uploaded or bundled), otherwise streams Play Store Build Kit
   router.get('/public/download-aab', (req, res) => {
-    const aabPath = path.join(UPLOADS_PATH, 'ambika-associate-crm.aab');
-    if (fs.existsSync(aabPath)) {
+    const uploadedAabPath = path.join(UPLOADS_PATH, 'ambika-associate-crm.aab');
+    const bundledAabPath = path.join(process.cwd(), 'public', 'ambika-associate-crm.aab');
+    const aabPath = fs.existsSync(uploadedAabPath)
+      ? uploadedAabPath
+      : fs.existsSync(bundledAabPath)
+        ? bundledAabPath
+        : null;
+    if (aabPath) {
+      const stat = fs.statSync(aabPath);
       res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Content-Length', String(stat.size));
       res.setHeader('Content-Disposition', 'attachment; filename="ambika-associate-crm.aab"');
       fs.createReadStream(aabPath).pipe(res);
       return;

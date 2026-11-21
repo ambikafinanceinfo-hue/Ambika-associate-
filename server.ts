@@ -46,7 +46,9 @@ async function startServer() {
 
   // Google Play Android App Links / Digital Asset Links verification
   app.get('/.well-known/assetlinks.json', (_req, res) => {
-    const fingerprints = String(process.env.ANDROID_SHA256_CERT_FINGERPRINTS || '')
+    const defaultFingerprint =
+      '8D:96:F2:F8:5F:0C:A3:D6:A0:C8:4B:2A:46:F7:09:A7:75:4E:BD:8C:5E:44:B2:51:70:18:14:84:BF:7F:99:E6';
+    const fingerprints = String(process.env.ANDROID_SHA256_CERT_FINGERPRINTS || defaultFingerprint)
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
@@ -79,7 +81,7 @@ async function startServer() {
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
     } else if (
-      /^\/(pwa-|apple-touch-icon|ambika-logo|icon\.svg|assets\/aistudio\/)/.test(p)
+      /^\/(pwa-|apple-touch-icon|ambika-logo|icon\.svg|assets\/aistudio\/|ambika-associate-crm\.apk)/.test(p)
     ) {
       res.setHeader('Cache-Control', 'no-cache, must-revalidate');
     }
