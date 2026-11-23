@@ -365,6 +365,25 @@ export const LoginView: React.FC<LoginViewProps> = ({
                   <a
                     href={`/api/public/download-apk?origin=${encodeURIComponent(window.location.origin)}`}
                     download={hasUploadedApk || apkDownloadUrl ? 'ambika-associate-crm.apk' : undefined}
+                    onClick={async (e) => {
+                      if (!hasUploadedApk) return;
+                      e.preventDefault();
+                      try {
+                        const res = await fetch(`/api/public/download-apk?origin=${encodeURIComponent(window.location.origin)}`);
+                        if (!res.ok) throw new Error('Download failed');
+                        const blob = await res.blob();
+                        const blobUrl = URL.createObjectURL(blob);
+                        const link = document.createElement('a');
+                        link.href = blobUrl;
+                        link.download = 'ambika-associate-crm.apk';
+                        document.body.appendChild(link);
+                        link.click();
+                        link.remove();
+                        setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+                      } catch {
+                        window.location.href = `/api/public/download-apk?origin=${encodeURIComponent(window.location.origin)}`;
+                      }
+                    }}
                     className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-[#EA580C] hover:bg-[#C2410C] text-white text-xs font-semibold"
                   >
                     <Package className="w-3.5 h-3.5" />

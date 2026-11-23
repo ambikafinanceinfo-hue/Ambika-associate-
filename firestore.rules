@@ -1,0 +1,242 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Default-Deny Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Global Security Primitives
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() &&
+        (
+          request.auth.token.email == 'rajadineshgupta0@gmail.com' ||
+          request.auth.token.email == 'ambikafinance.info@gmail.com'
+        );
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() ||
+        (isVerifiedUser() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    // 3. Entity Validation Blueprints (Anti-Update-Gap)
+    function isValidAdminAccount(data, adminUid) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'role', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'displayName', 'role', 'createdAt', 'updatedAt']) &&
+        data.uid is string && data.uid == adminUid && data.uid == request.auth.uid && data.uid.size() <= 128 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        data.role == 'SUPER_ADMIN' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidEmployeeRole(role) {
+      return role in [
+        'SUPER_ADMIN',
+        'BRANCH_MANAGER',
+        'TEAM_LEADER',
+        'LEAD_GENERATOR',
+        'FIELD_OFFICER',
+        'REFERRAL_PARTNER'
+      ];
+    }
+
+    function isValidEmployeeRecord(data, employeeCode) {
+      return data.keys().hasAll([
+          'ownerUid', 'employeeCode', 'fullName', 'mobile', 'email',
+          'passwordHash', 'adminSavedPasswordEnc', 'role', 'branchCode',
+          'teamName', 'reportsToEmployeeCode', 'referralCode', 'serviceCity',
+          'servicePincodes', 'isActive', 'otpEnabled', 'preferredLang',
+          'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid', 'employeeCode', 'fullName', 'mobile', 'email',
+          'passwordHash', 'adminSavedPasswordEnc', 'role', 'branchCode',
+          'teamName', 'reportsToEmployeeCode', 'referralCode', 'serviceCity',
+          'servicePincodes', 'isActive', 'otpEnabled', 'preferredLang',
+          'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.employeeCode is string && data.employeeCode == employeeCode &&
+        data.employeeCode.size() >= 2 && data.employeeCode.size() <= 32 &&
+        data.employeeCode.matches('^[A-Za-z0-9_\\-]+$') &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        data.mobile is string && data.mobile.size() <= 24 &&
+        data.email is string && data.email.size() <= 160 &&
+        data.passwordHash is string && data.passwordHash.size() >= 10 && data.passwordHash.size() <= 200 &&
+        data.adminSavedPasswordEnc is string && data.adminSavedPasswordEnc.size() <= 512 &&
+        data.role is string && isValidEmployeeRole(data.role) &&
+        data.branchCode is string && data.branchCode.size() <= 40 &&
+        data.teamName is string && data.teamName.size() <= 120 &&
+        data.reportsToEmployeeCode is string && data.reportsToEmployeeCode.size() <= 32 &&
+        data.referralCode is string && data.referralCode.size() <= 40 &&
+        data.serviceCity is string && data.serviceCity.size() <= 80 &&
+        data.servicePincodes is string && data.servicePincodes.size() <= 400 &&
+        data.isActive is bool &&
+        data.otpEnabled is bool &&
+        data.preferredLang in ['en', 'hi'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidBranchRecord(data, branchCode) {
+      return data.keys().hasAll(['ownerUid', 'code', 'name', 'city', 'state', 'isActive', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerUid', 'code', 'name', 'city', 'state', 'isActive', 'createdAt', 'updatedAt']) &&
+        isValidId(data.ownerUid) &&
+        data.code is string && data.code == branchCode &&
+        data.code.size() >= 2 && data.code.size() <= 40 &&
+        data.code.matches('^[A-Za-z0-9_\\-]+$') &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.city is string && data.city.size() <= 80 &&
+        data.state is string && data.state.size() <= 80 &&
+        data.isActive is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidSettingRecord(data, settingKey) {
+      return data.keys().hasAll([
+          'ownerUid', 'settingKey', 'officeName', 'officeAddress',
+          'petrolRatePerKm', 'attendanceCutoffTime', 'attendanceLatePenaltyInr',
+          'unapprovedLeavePenaltyInr', 'defaultLanguage', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerUid', 'settingKey', 'officeName', 'officeAddress',
+          'petrolRatePerKm', 'attendanceCutoffTime', 'attendanceLatePenaltyInr',
+          'unapprovedLeavePenaltyInr', 'defaultLanguage', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.ownerUid) &&
+        data.settingKey is string && data.settingKey == settingKey &&
+        data.settingKey.size() >= 2 && data.settingKey.size() <= 64 &&
+        data.settingKey.matches('^[A-Za-z0-9_\\-]+$') &&
+        data.officeName is string && data.officeName.size() <= 140 &&
+        data.officeAddress is string && data.officeAddress.size() <= 300 &&
+        data.petrolRatePerKm is number && data.petrolRatePerKm >= 0 && data.petrolRatePerKm <= 100 &&
+        data.attendanceCutoffTime is string && data.attendanceCutoffTime.size() <= 16 &&
+        data.attendanceLatePenaltyInr is number && data.attendanceLatePenaltyInr >= 0 && data.attendanceLatePenaltyInr <= 10000 &&
+        data.unapprovedLeavePenaltyInr is number && data.unapprovedLeavePenaltyInr >= 0 && data.unapprovedLeavePenaltyInr <= 10000 &&
+        data.defaultLanguage in ['en', 'hi'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // 4. Authorized Admin Profiles
+    match /admins/{adminUid} {
+      allow get: if isVerifiedUser() && isValidId(adminUid) && (request.auth.uid == adminUid || isBootstrappedAdmin());
+      allow list: if isBootstrappedAdmin() && resource.data.role == 'SUPER_ADMIN';
+      allow create: if isBootstrappedAdmin() &&
+        isValidId(adminUid) &&
+        isValidAdminAccount(incoming(), adminUid) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isBootstrappedAdmin() &&
+        isValidId(adminUid) &&
+        isValidAdminAccount(incoming(), adminUid) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['email', 'displayName', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // 5. Persistent CRM Employees & Encrypted Credentials Vault (Admin Only)
+    match /crm_employees/{employeeCode} {
+      allow get: if isVerifiedUser() && isValidId(employeeCode) && isAdmin();
+      allow list: if isAdmin() && resource.data.employeeCode is string;
+      allow create: if isVerifiedUser() &&
+        isValidId(employeeCode) &&
+        isValidEmployeeRecord(incoming(), employeeCode) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+      allow update: if isVerifiedUser() &&
+        isValidId(employeeCode) &&
+        isValidEmployeeRecord(incoming(), employeeCode) &&
+        incoming().employeeCode == existing().employeeCode &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'fullName', 'mobile', 'email', 'passwordHash', 'adminSavedPasswordEnc',
+          'role', 'branchCode', 'teamName', 'reportsToEmployeeCode', 'referralCode',
+          'serviceCity', 'servicePincodes', 'isActive', 'otpEnabled', 'preferredLang',
+          'updatedAt'
+        ]) &&
+        isAdmin();
+      allow delete: if isVerifiedUser() && isValidId(employeeCode) && isAdmin();
+    }
+
+    // 6. Persistent CRM Branches (Admin Only)
+    match /crm_branches/{branchCode} {
+      allow get: if isVerifiedUser() && isValidId(branchCode) && isAdmin();
+      allow list: if isAdmin() && resource.data.code is string;
+      allow create: if isVerifiedUser() &&
+        isValidId(branchCode) &&
+        isValidBranchRecord(incoming(), branchCode) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+      allow update: if isVerifiedUser() &&
+        isValidId(branchCode) &&
+        isValidBranchRecord(incoming(), branchCode) &&
+        incoming().code == existing().code &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'city', 'state', 'isActive', 'updatedAt']) &&
+        isAdmin();
+      allow delete: if isVerifiedUser() && isValidId(branchCode) && isAdmin();
+    }
+
+    // 7. Persistent CRM Settings (Admin Only)
+    match /crm_settings/{settingKey} {
+      allow get: if isVerifiedUser() && isValidId(settingKey) && isAdmin();
+      allow list: if isAdmin() && resource.data.settingKey is string;
+      allow create: if isVerifiedUser() &&
+        isValidId(settingKey) &&
+        isValidSettingRecord(incoming(), settingKey) &&
+        incoming().ownerUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        isAdmin();
+      allow update: if isVerifiedUser() &&
+        isValidId(settingKey) &&
+        isValidSettingRecord(incoming(), settingKey) &&
+        incoming().settingKey == existing().settingKey &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'officeName', 'officeAddress', 'petrolRatePerKm', 'attendanceCutoffTime',
+          'attendanceLatePenaltyInr', 'unapprovedLeavePenaltyInr', 'defaultLanguage', 'updatedAt'
+        ]) &&
+        isAdmin();
+      allow delete: if false;
+    }
+  }
+}

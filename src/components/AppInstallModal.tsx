@@ -133,6 +133,9 @@ export const AppInstallModal: React.FC<AppInstallModalProps> = ({
     }
   };
 
+  const [apkQrDataUrl, setApkQrDataUrl] = useState<string | null>(null);
+  const [downloadingApk, setDownloadingApk] = useState(false);
+
   const originParam =
     typeof window !== 'undefined' ? encodeURIComponent(window.location.origin) : '';
   const directApkHref = `/api/public/download-apk?origin=${originParam}`;
@@ -140,9 +143,62 @@ export const AppInstallModal: React.FC<AppInstallModalProps> = ({
   const androidKitHref = `/api/public/android-app-kit?origin=${originParam}`;
   const iosProfileHref = `/api/public/ios-app-profile?origin=${originParam}`;
   const hasDirectBinaryApk = Boolean(hasUploadedApk || apkDownloadUrl);
-  const apkSizeLabel = apkFileSize ? `${(apkFileSize / (1024 * 1024)).toFixed(1)} MB` : null;
-  const aabSizeLabel = aabFileSize ? `${(aabFileSize / (1024 * 1024)).toFixed(1)} MB` : null;
+  const formatBinarySize = (bytes?: number | null) => {
+    if (!bytes) return null;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  };
+  const apkSizeLabel = formatBinarySize(apkFileSize);
+  const aabSizeLabel = formatBinarySize(aabFileSize);
   const legalBaseUrl = defaultMobileUrl || currentOrigin;
+  const directApkFullUrl = `${currentOrigin || defaultMobileUrl}/api/public/download-apk`;
+
+  useEffect(() => {
+    if (!hasUploadedApk || !directApkFullUrl) {
+      setApkQrDataUrl(null);
+      return;
+    }
+    let cancelled = false;
+    QRCode.toDataURL(directApkFullUrl, { width: 180, margin: 1, color: { dark: '#0F2744', light: '#FFFFFF' } })
+      .then((url) => {
+        if (!cancelled) setApkQrDataUrl(url);
+      })
+      .catch(() => {
+        if (!cancelled) setApkQrDataUrl(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hasUploadedApk, directApkFullUrl]);
+
+  const handleDirectApkDownload = async (e: React.MouseEvent<HTMLAnchorElement>) => {
+    if (!hasUploadedApk) return;
+    e.preventDefault();
+    if (downloadingApk) return;
+    setDownloadingApk(true);
+    try {
+      const res = await fetch(directApkHref);
+      if (!res.ok) throw new Error('Download failed');
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.download = 'ambika-associate-crm.apk';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+      setInstallNotice(
+        lang === 'hi'
+          ? 'ambika-associate-crm.apk डाउनलोड शुरू हो गया है! इसे Android फोन पर खोलकर इंस्टॉल करें।'
+          : 'ambika-associate-crm.apk downloaded! Open it on your Android phone to install.'
+      );
+    } catch {
+      window.location.href = directApkHref;
+    } finally {
+      setDownloadingApk(false);
+    }
+  };
 
   const handleOneTapInstall = async () => {
     setInstalling(true);
@@ -251,11 +307,12 @@ export const AppInstallModal: React.FC<AppInstallModalProps> = ({
             </div>
             <a
               href={directApkHref}
+              onClick={handleDirectApkDownload}
               download={hasUploadedApk ? 'ambika-associate-crm.apk' : undefined}
               className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#EA580C] hover:bg-[#C2410C] text-white text-xs font-semibold shadow-xs transition-colors whitespace-nowrap shrink-0"
             >
               <Download className="w-4 h-4" />
-              <span>{lang === 'hi' ? 'Download APK' : 'Download APK'}</span>
+              <span>{downloadingApk ? 'Downloading...' : 'Download APK'}</span>
             </a>
           </div>
 
@@ -563,15 +620,18 @@ export const AppInstallModal: React.FC<AppInstallModalProps> = ({
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                   <a
                     href={directApkHref}
+                    onClick={handleDirectApkDownload}
                     download={hasUploadedApk ? 'ambika-associate-crm.apk' : undefined}
                     className="inline-flex items-center justify-center gap-2 px-3.5 py-2.5 rounded-lg bg-[#EA580C] hover:bg-[#C2410C] text-white text-xs font-semibold transition-colors"
                   >
                     <Download className="w-4 h-4" />
                     <span>
-                      {hasDirectBinaryApk
+                      {downloadingApk
+                        ? 'Downloading APK...'
+                        : hasDirectBinaryApk
                         ? lang === 'hi'
-                          ? 'APK फ़ाइल डाउनलोड करें'
-                          : 'Download Android APK'
+                          ? `APK डाउनलोड करें (${apkSizeLabel || 'Ready'})`
+                          : `Download Android APK (${apkSizeLabel || 'Ready'})`
                         : lang === 'hi'
                         ? 'Download APK Kit'
                         : 'Download APK Builder Kit'}
@@ -610,6 +670,47 @@ export const AppInstallModal: React.FC<AppInstallModalProps> = ({
                     </a>
                   )}
                 </div>
+
+                {hasUploadedApk && apkQrDataUrl && (
+                  <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex flex-col sm:flex-row items-center gap-3.5">
+                    <img
+                      src={apkQrDataUrl}
+                      alt="Scan to Download Ambika Associate APK"
+                      className="w-28 h-28 rounded-lg border border-slate-200 bg-white p-1 shrink-0"
+                    />
+                    <div className="space-y-1.5 text-[11px] text-slate-600 min-w-0 flex-1">
+                      <div className="font-display font-bold text-xs text-[#0F2744]">
+                        {lang === 'hi'
+                          ? 'Android फोन से स्कैन करके सीधे APK डाउनलोड करें'
+                          : 'Scan with Android Phone to Download APK Directly'}
+                      </div>
+                      <p className="leading-relaxed">
+                        Signed <span className="font-mono font-semibold text-[#0F2744]">ambika-associate-crm.apk</span> ({apkSizeLabel || '214 KB'}) · Android 7–15 (API 24–35). After downloading, tap the file and enable <strong>Install unknown apps</strong> if prompted.
+                      </p>
+                      <div className="flex items-center gap-1.5 pt-0.5">
+                        <input
+                          type="text"
+                          readOnly
+                          value={directApkFullUrl}
+                          aria-label="Direct APK Download URL"
+                          className="flex-1 min-w-0 px-2 py-1 text-[10px] font-mono bg-white border border-slate-200 rounded text-[#0F2744]"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleCopyLegalUrl('apk_url', directApkFullUrl)}
+                          className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[#0F2744] hover:bg-[#16365D] text-white text-[10px] font-semibold shrink-0"
+                        >
+                          {copiedLegalKey === 'apk_url' ? (
+                            <Check className="w-3 h-3 text-green-300" />
+                          ) : (
+                            <Copy className="w-3 h-3" />
+                          )}
+                          {copiedLegalKey === 'apk_url' ? 'Copied' : 'Copy'}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {!hasDirectBinaryApk && (
                   <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 text-[11px] text-slate-600 space-y-1">

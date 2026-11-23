@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { RefreshCw, ArrowUpRight, PhoneCall, Target, QrCode, ShieldCheck, UserPlus, BarChart3, PieChart as PieChartIcon, CalendarCheck2, CheckCircle2 } from 'lucide-react';
+import { RefreshCw, ArrowUpRight, PhoneCall, Target, QrCode, ShieldCheck, UserPlus, BarChart3, PieChart as PieChartIcon, CalendarCheck2, CheckCircle2, Network } from 'lucide-react';
 import {
   ResponsiveContainer,
   BarChart,
@@ -183,6 +183,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({ user, lang, logoDa
             <RefreshCw className="w-3.5 h-3.5" />
             Refresh
           </button>
+          {['SUPER_ADMIN', 'BRANCH_MANAGER', 'TEAM_LEADER'].includes(user.role) && (
+            <button
+              type="button"
+              onClick={() => onNavigate('bm-downline')}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg bg-[#0F2744] hover:bg-[#16365D] text-white whitespace-nowrap shrink-0"
+            >
+              <Network className="w-3.5 h-3.5 text-[#EA580C]" />
+              {user.role === 'TEAM_LEADER'
+                ? lang === 'hi'
+                  ? 'मेरे 10 FO व रेफरल'
+                  : 'My 10 FOs & Referrals'
+                : lang === 'hi'
+                ? 'BM डाउनलाइन · 10 TL / 10 FO / टारगेट'
+                : 'BM Downline · 10 TLs, FOs & Targets'}
+            </button>
+          )}
           {user.role === 'SUPER_ADMIN' && (
             <button
               type="button"

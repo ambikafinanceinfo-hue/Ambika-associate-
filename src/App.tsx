@@ -28,6 +28,7 @@ import {
   Download,
   FileText,
   Pencil,
+  Network,
 } from 'lucide-react';
 import type { AlertRecord, AuthUser, SystemSettings } from '../shared/types';
 import { apiFetch, getStoredToken, setStoredToken } from './lib/api';
@@ -60,6 +61,7 @@ import { ReferralConsoleModule } from './components/ReferralConsoleModule';
 import { LegalTermsModal, type LegalTab } from './components/LegalTermsModal';
 import { ProfileModal } from './components/ProfileModal';
 import { AttendanceLeaveModule } from './components/AttendanceLeaveModule';
+import { BmDownlinePanel } from './components/BmDownlinePanel';
 
 export interface NavEntry {
   tab: string;
@@ -636,6 +638,12 @@ export default function App() {
 
   const navItems = [
     { id: 'dashboard', label: t(lang, 'navDashboard'), icon: LayoutDashboard, visible: true },
+    {
+      id: 'bm-downline',
+      label: user.role === 'TEAM_LEADER' ? t(lang, 'navTlDownline') : t(lang, 'navBmDownline'),
+      icon: Network,
+      visible: isManager,
+    },
     { id: 'leads', label: t(lang, 'navLeads'), icon: Users, visible: true },
     {
       id: 'referrals',
@@ -1290,6 +1298,13 @@ export default function App() {
               lang={lang}
               logoDataUrl={settings.companyLogoDataUrl}
               onNavigate={(tab, subOption) => navigateTo(tab, null, subOption ?? null)}
+              onOpenLead={(leadId) => navigateTo('leads', leadId)}
+            />
+          )}
+          {activeTab === 'bm-downline' && isManager && (
+            <BmDownlinePanel
+              user={user}
+              lang={lang}
               onOpenLead={(leadId) => navigateTo('leads', leadId)}
             />
           )}

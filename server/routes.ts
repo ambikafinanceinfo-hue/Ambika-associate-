@@ -27,6 +27,7 @@ import {
   logAudit,
   seedSalesExtensionsIfNeeded,
   seedVerificationDatasetInternal,
+  syncUsersBackupToDisk,
   updateSetting,
   UPLOADS_PATH,
 } from './db.ts';
@@ -6303,7 +6304,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     '/admin/users',
     requireAuth,
     requireRoles('SUPER_ADMIN', 'BRANCH_MANAGER', 'TEAM_LEADER', 'LEAD_GENERATOR'),
-    (_req, res) => {
+    (req: AuthedRequest, res) => {
       const childCountRows = db
         .prepare(`
           SELECT reports_to_user_id as parentId, role as childRole, COUNT(*) as cnt
@@ -6325,13 +6326,14 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
             u.reports_to_user_id as reportsToUserId, rep.full_name as reportsToName, rep.employee_code as reportsToCode,
             u.referral_code as referralCode, u.service_city as serviceCity, u.service_pincodes as servicePincodes,
             u.profile_photo_data_url as profilePhotoDataUrl,
+            u.admin_saved_password_enc as adminSavedPasswordEnc,
             u.is_active as isActive, u.otp_enabled as otpEnabled,
             u.gps_consent as gpsConsent, u.camera_consent as cameraConsent, u.created_at as createdAt
           FROM users u
           LEFT JOIN branches b ON b.id = u.branch_id
           LEFT JOIN teams t ON t.id = u.team_id
           LEFT JOIN users rep ON rep.id = u.reports_to_user_id
-          ORDER BY u.id ASC
+          ORDER BY CASE WHEN u.role = 'SUPER_ADMIN' THEN 0 ELSE 1 END, u.id DESC
         `)
         .all()
         .map((u: any) => {
@@ -6347,8 +6349,18 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
             childCount = childCountsMap.get(`${u.id}:REFERRAL_PARTNER`) ?? 0;
             quotaMax = HIERARCHY_LIMITS.REFERRALS_PER_FO;
           }
+          const { adminSavedPasswordEnc, ...rest } = u;
+          let savedPassword: string | null = null;
+          if (req.user!.role === 'SUPER_ADMIN' && adminSavedPasswordEnc) {
+            try {
+              savedPassword = decryptPii(adminSavedPasswordEnc) || null;
+            } catch {
+              savedPassword = null;
+            }
+          }
           return {
-            ...u,
+            ...rest,
+            savedPassword,
             isActive: Boolean(u.isActive),
             otpEnabled: Boolean(u.otpEnabled),
             gpsConsent: Boolean(u.gpsConsent),
@@ -6511,8 +6523,8 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     try {
       const inserted = db
         .prepare(`
-          INSERT INTO users (employee_code, full_name, mobile, email, password_hash, role, branch_id, team_id, reports_to_user_id, referral_code, service_city, service_pincodes, is_active, otp_enabled)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+          INSERT INTO users (employee_code, full_name, mobile, email, password_hash, admin_saved_password_enc, role, branch_id, team_id, reports_to_user_id, referral_code, service_city, service_pincodes, is_active, otp_enabled)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         `)
         .run(
           cleanCode,
@@ -6520,6 +6532,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
           cleanMobile,
           String(email || `${cleanCode.toLowerCase()}@ambikaassociate.in`).trim(),
           hash,
+          encryptPii(cleanPass),
           cleanRole,
           resolvedBranchId,
           resolvedTeamId,
@@ -6539,6 +6552,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
         db.prepare(`UPDATE users SET team_id = ? WHERE id = ?`).run(resolvedTeamId, newUserId);
       }
 
+      syncUsersBackupToDisk();
       logAudit(admin, 'USER_CREATED', 'USER', cleanCode, `Created ${cleanRole} login ID ${cleanCode} (${cleanName})`);
       broadcastLiveSync('HIERARCHY_UPDATED', `New ${cleanRole} ID ${cleanCode} (${cleanName}) added by Admin`, admin);
       res.status(201).json({
@@ -6621,8 +6635,8 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     }
 
     const stmt = db.prepare(`
-      INSERT INTO users (employee_code, full_name, mobile, email, password_hash, role, branch_id, team_id, reports_to_user_id, referral_code, service_city, service_pincodes, is_active, otp_enabled)
-      VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
+      INSERT INTO users (employee_code, full_name, mobile, email, password_hash, admin_saved_password_enc, role, branch_id, team_id, reports_to_user_id, referral_code, service_city, service_pincodes, is_active, otp_enabled)
+      VALUES (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
     `);
 
     const createdList: {
@@ -6666,6 +6680,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
           fullName,
           email,
           passHash,
+          encryptPii(plainPassword),
           cleanRole,
           resolvedBranchId,
           inheritedTeamId,
@@ -6697,6 +6712,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     });
 
     runBatch();
+    syncUsersBackupToDisk();
 
     logAudit(
       admin,
@@ -6888,7 +6904,11 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     if (typeof otpEnabled === 'boolean') db.prepare('UPDATE users SET otp_enabled = ? WHERE id = ?').run(otpEnabled ? 1 : 0, targetId);
     if (newPassword && String(newPassword).trim()) {
       const cleanNewPass = String(newPassword).trim();
-      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(bcrypt.hashSync(cleanNewPass, 10), targetId);
+      db.prepare('UPDATE users SET password_hash = ?, admin_saved_password_enc = ? WHERE id = ?').run(
+        bcrypt.hashSync(cleanNewPass, 10),
+        encryptPii(cleanNewPass),
+        targetId
+      );
       logAudit(
         admin,
         'PASSWORD_RESET',
@@ -6898,6 +6918,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       );
     }
 
+    syncUsersBackupToDisk();
     if (typeof isActive !== 'boolean' && !newPassword && !renamedEmpCode && renamedRefCode === undefined) {
       logAudit(
         admin,
@@ -7806,6 +7827,592 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     res.json({ ok: true });
   });
 
+  // ============================================================================
+  // BM DOWNLINE COMMAND CENTER (10 TLs -> 10 FOs -> REFERRALS, LEADS & ENQUIRIES)
+  // ============================================================================
+  router.get(
+    '/bm/downline-hierarchy',
+    requireAuth,
+    requireRoles('SUPER_ADMIN', 'BRANCH_MANAGER', 'TEAM_LEADER'),
+    (req: AuthedRequest, res) => {
+      const caller = req.user!;
+      const rawMonth = typeof req.query.month === 'string' ? req.query.month.trim() : '';
+      const monthKey = /^\d{4}-\d{2}$/.test(rawMonth) ? rawMonth : new Date().toISOString().slice(0, 7);
+
+      const allBms = db
+        .prepare(`
+          SELECT u.id, u.employee_code as employeeCode, u.full_name as fullName,
+                 u.mobile, u.email, u.is_active as isActive, u.branch_id as branchId,
+                 b.name as branchName, b.code as branchCode,
+                 (SELECT COUNT(*) FROM users tl WHERE tl.role = 'TEAM_LEADER' AND tl.reports_to_user_id = u.id) as tlCount
+          FROM users u
+          LEFT JOIN branches b ON b.id = u.branch_id
+          WHERE u.role = 'BRANCH_MANAGER'
+          ORDER BY tlCount DESC, u.id ASC
+        `)
+        .all() as any[];
+
+      let selectedBm: any = null;
+      let tlRows: any[] = [];
+
+      if (caller.role === 'TEAM_LEADER') {
+        const myTl = db
+          .prepare(`
+            SELECT u.id, u.employee_code as employeeCode, u.full_name as fullName,
+                   u.mobile, u.email, u.is_active as isActive, u.branch_id as branchId,
+                   u.reports_to_user_id as reportsToUserId, u.created_at as createdAt,
+                   b.name as branchName, t.name as teamName
+            FROM users u
+            LEFT JOIN branches b ON b.id = u.branch_id
+            LEFT JOIN teams t ON t.id = u.team_id
+            WHERE u.id = ?
+          `)
+          .get(caller.id) as any;
+        tlRows = myTl ? [myTl] : [];
+        selectedBm =
+          (myTl?.reportsToUserId
+            ? allBms.find((b) => Number(b.id) === Number(myTl.reportsToUserId))
+            : null) || {
+            id: caller.id,
+            employeeCode: caller.employeeCode,
+            fullName: caller.fullName,
+            mobile: caller.mobile,
+            branchId: caller.branchId,
+            branchName: caller.branchName || 'Branch',
+            branchCode: '',
+            tlCount: 1,
+          };
+      } else {
+        const requestedBmId = req.query.bmId ? Number(req.query.bmId) : null;
+        if (caller.role === 'BRANCH_MANAGER') {
+          selectedBm = allBms.find((b) => Number(b.id) === Number(caller.id)) || {
+            id: caller.id,
+            employeeCode: caller.employeeCode,
+            fullName: caller.fullName,
+            mobile: caller.mobile,
+            branchId: caller.branchId,
+            branchName: caller.branchName || 'Branch',
+            branchCode: '',
+            tlCount: 0,
+          };
+        } else {
+          selectedBm =
+            (requestedBmId ? allBms.find((b) => Number(b.id) === requestedBmId) : null) ||
+            allBms[0] ||
+            null;
+        }
+
+        if (selectedBm) {
+          tlRows = db
+            .prepare(`
+              SELECT u.id, u.employee_code as employeeCode, u.full_name as fullName,
+                     u.mobile, u.email, u.is_active as isActive, u.branch_id as branchId,
+                     u.reports_to_user_id as reportsToUserId, u.created_at as createdAt,
+                     b.name as branchName, t.name as teamName
+              FROM users u
+              LEFT JOIN branches b ON b.id = u.branch_id
+              LEFT JOIN teams t ON t.id = u.team_id
+              WHERE u.role = 'TEAM_LEADER' AND u.reports_to_user_id = ?
+              ORDER BY u.id ASC
+              LIMIT 10
+            `)
+            .all(selectedBm.id) as any[];
+        }
+      }
+
+      const tlIds = tlRows.map((t) => Number(t.id));
+      const foRows: any[] =
+        tlIds.length > 0
+          ? (db
+              .prepare(`
+                SELECT u.id, u.employee_code as employeeCode, u.full_name as fullName,
+                       u.mobile, u.email, u.is_active as isActive, u.branch_id as branchId,
+                       u.reports_to_user_id as reportsToUserId, u.service_city as serviceCity,
+                       u.service_pincodes as servicePincodes, u.created_at as createdAt
+                FROM users u
+                WHERE u.role = 'FIELD_OFFICER' AND u.reports_to_user_id IN (${tlIds.map(() => '?').join(',')})
+                ORDER BY u.id ASC
+              `)
+              .all(...tlIds) as any[])
+          : [];
+
+      const foIds = foRows.map((f) => Number(f.id));
+      const refRows: any[] =
+        foIds.length > 0
+          ? (db
+              .prepare(`
+                SELECT u.id, u.employee_code as employeeCode, u.referral_code as referralCode,
+                       u.full_name as fullName, u.mobile, u.email, u.is_active as isActive,
+                       u.reports_to_user_id as reportsToUserId, u.service_city as serviceCity,
+                       u.created_at as createdAt
+                FROM users u
+                WHERE u.role = 'REFERRAL_PARTNER' AND u.reports_to_user_id IN (${foIds.map(() => '?').join(',')})
+                ORDER BY u.id ASC
+              `)
+              .all(...foIds) as any[])
+          : [];
+
+      const targetUserIds = [...tlIds, ...foIds];
+      const targetMap = new Map<number, { id: number; targetLeads: number; targetAmount: number }>();
+      if (targetUserIds.length > 0) {
+        const targetRows = db
+          .prepare(`
+            SELECT id, user_id as userId, target_leads as targetLeads, target_amount as targetAmount
+            FROM sales_targets
+            WHERE month_key = ? AND user_id IN (${targetUserIds.map(() => '?').join(',')})
+          `)
+          .all(monthKey, ...targetUserIds) as any[];
+        for (const tr of targetRows) {
+          targetMap.set(Number(tr.userId), {
+            id: Number(tr.id),
+            targetLeads: Number(tr.targetLeads || 0),
+            targetAmount: Number(tr.targetAmount || 0),
+          });
+        }
+      }
+
+      // Load all relevant leads, enquiries, and referral payouts once for crisp in-memory attribution
+      const allLeads = db
+        .prepare(`
+          SELECT l.id, l.lead_code as leadCode, l.customer_name as customerName,
+                 l.loan_product as loanProduct, l.loan_amount as loanAmount, l.bank_nbfc as bankNbfc,
+                 l.status, l.referral_id as referralId, l.referral_name as referralName,
+                 l.created_by as createdBy, l.assigned_bm_id as assignedBmId,
+                 l.assigned_tl_id as assignedTlId, l.assigned_officer_id as assignedOfficerId,
+                 l.created_at as createdAt, l.updated_at as updatedAt
+          FROM leads l
+          ORDER BY l.id DESC
+        `)
+        .all() as any[];
+
+      const allEnquiries = db
+        .prepare(`
+          SELECT e.id, e.enquiry_code as enquiryCode, e.lead_id as leadId,
+                 l.lead_code as leadCode, e.referral_user_id as referralUserId,
+                 e.referral_code as referralCode, u.full_name as referralName,
+                 e.category, e.description, e.assigned_officer_id as assignedOfficerId,
+                 e.status, e.solution_text as solutionText, e.sla_deadline_at as slaDeadlineAt,
+                 e.created_at as createdAt, e.updated_at as updatedAt
+          FROM enquiries e
+          LEFT JOIN leads l ON l.id = e.lead_id
+          LEFT JOIN users u ON u.id = e.referral_user_id
+          ORDER BY e.id DESC
+        `)
+        .all() as any[];
+
+      const allPayouts = db
+        .prepare(`
+          SELECT lead_id as leadId, referral_user_id as referralUserId, referral_code as referralCode,
+                 payout_amount as payoutAmount, payout_status as payoutStatus
+          FROM referral_payouts
+        `)
+        .all() as any[];
+
+      const nowMs = Date.now();
+      const isCompletedStatus = (st: string) => st === 'Disbursed' || st === 'Closed';
+      const isDisbursedStatus = (st: string) => st === 'Disbursed';
+      const isRejectedStatus = (st: string) => st === 'Rejected';
+      const isOpenEnquiry = (st: string) => st !== 'Resolved' && st !== 'Closed';
+      const isOverdueEnquiry = (enq: any) => {
+        if (!isOpenEnquiry(enq.status) || enq.status === 'Solution Updated') return false;
+        const deadlineMs = Date.parse(String(enq.slaDeadlineAt || ''));
+        return Number.isFinite(deadlineMs) && deadlineMs < nowMs;
+      };
+
+      const refsByFo = new Map<number, any[]>();
+      for (const r of refRows) {
+        const foId = Number(r.reportsToUserId);
+        const list = refsByFo.get(foId) || [];
+        list.push(r);
+        refsByFo.set(foId, list);
+      }
+
+      const fosByTl = new Map<number, any[]>();
+      for (const f of foRows) {
+        const tlId = Number(f.reportsToUserId);
+        const list = fosByTl.get(tlId) || [];
+        list.push(f);
+        fosByTl.set(tlId, list);
+      }
+
+      const teamLeaders = tlRows.map((tl) => {
+        const tlId = Number(tl.id);
+        const tlFosRaw = (fosByTl.get(tlId) || []).slice(0, 10);
+        const tlLeadMap = new Map<number, any>();
+        const tlEnquiryMap = new Map<number, any>();
+
+        const fieldOfficers = tlFosRaw.map((fo) => {
+          const foId = Number(fo.id);
+          const foRefsRaw = refsByFo.get(foId) || [];
+          const refUserIds = new Set<number>(foRefsRaw.map((r) => Number(r.id)));
+          const refCodeSet = new Set<string>();
+          for (const r of foRefsRaw) {
+            if (r.referralCode) refCodeSet.add(String(r.referralCode).trim().toUpperCase());
+            if (r.employeeCode) refCodeSet.add(String(r.employeeCode).trim().toUpperCase());
+          }
+
+          // Match leads assigned to this FO or originated by any of this FO's mapped referrals
+          const foLeads = allLeads.filter((l) => {
+            if (Number(l.assignedOfficerId) === foId) return true;
+            if (refUserIds.has(Number(l.createdBy))) return true;
+            const refTag = String(l.referralId || '').trim().toUpperCase();
+            if (refTag && refCodeSet.has(refTag)) return true;
+            return false;
+          });
+          const foLeadIds = new Set<number>(foLeads.map((l) => Number(l.id)));
+
+          // Match enquiries assigned to this FO, raised by their mapped referrals, or linked to their leads
+          const foEnquiries = allEnquiries.filter((e) => {
+            if (Number(e.assignedOfficerId) === foId) return true;
+            if (refUserIds.has(Number(e.referralUserId))) return true;
+            if (e.leadId && foLeadIds.has(Number(e.leadId))) return true;
+            const refTag = String(e.referralCode || '').trim().toUpperCase();
+            if (refTag && refCodeSet.has(refTag)) return true;
+            return false;
+          });
+
+          for (const l of foLeads) tlLeadMap.set(Number(l.id), l);
+          for (const e of foEnquiries) tlEnquiryMap.set(Number(e.id), e);
+
+          const referrals = foRefsRaw.map((ref) => {
+            const refId = Number(ref.id);
+            const rCode = String(ref.referralCode || '').trim().toUpperCase();
+            const eCode = String(ref.employeeCode || '').trim().toUpperCase();
+            const rLeads = foLeads.filter((l) => {
+              if (Number(l.createdBy) === refId) return true;
+              const lRef = String(l.referralId || '').trim().toUpperCase();
+              return Boolean(lRef && (lRef === rCode || lRef === eCode));
+            });
+            const rEnqs = foEnquiries.filter((e) => {
+              if (Number(e.referralUserId) === refId) return true;
+              const eRef = String(e.referralCode || '').trim().toUpperCase();
+              return Boolean(eRef && (eRef === rCode || eRef === eCode));
+            });
+            const rPayouts = allPayouts.filter((p) => {
+              if (Number(p.referralUserId) === refId) return true;
+              const pRef = String(p.referralCode || '').trim().toUpperCase();
+              return Boolean(pRef && (pRef === rCode || pRef === eCode));
+            });
+            const disbursedLeads = rLeads.filter((l) => isDisbursedStatus(l.status));
+            const completedLeads = rLeads.filter((l) => isCompletedStatus(l.status));
+            const rejectedLeads = rLeads.filter((l) => isRejectedStatus(l.status));
+            const inProgressLeads = rLeads.filter((l) => !isCompletedStatus(l.status) && !isRejectedStatus(l.status));
+
+            return {
+              id: refId,
+              employeeCode: ref.employeeCode,
+              referralCode: ref.referralCode || ref.employeeCode,
+              fullName: ref.fullName,
+              mobile: ref.mobile || '',
+              email: ref.email || '',
+              isActive: Boolean(ref.isActive),
+              serviceCity: ref.serviceCity || '',
+              leadsTotal: rLeads.length,
+              leadsInProgress: inProgressLeads.length,
+              leadsCompleted: completedLeads.length,
+              leadsDisbursed: disbursedLeads.length,
+              leadsRejected: rejectedLeads.length,
+              disbursedAmount: disbursedLeads.reduce((s, l) => s + Number(l.loanAmount || 0), 0),
+              enquiriesTotal: rEnqs.length,
+              enquiriesOpen: rEnqs.filter((e) => isOpenEnquiry(e.status)).length,
+              enquiriesResolved: rEnqs.filter((e) => !isOpenEnquiry(e.status)).length,
+              payoutPending: rPayouts
+                .filter((p) => p.payoutStatus !== 'PAID')
+                .reduce((s, p) => s + Number(p.payoutAmount || 0), 0),
+              payoutPaid: rPayouts
+                .filter((p) => p.payoutStatus === 'PAID')
+                .reduce((s, p) => s + Number(p.payoutAmount || 0), 0),
+            };
+          });
+
+          const foTarget = targetMap.get(foId);
+          const foTargetLeads = foTarget?.targetLeads ?? 0;
+          const foTargetAmount = foTarget?.targetAmount ?? 0;
+          const foCompleted = foLeads.filter((l) => isCompletedStatus(l.status));
+          const foDisbursed = foLeads.filter((l) => isDisbursedStatus(l.status));
+          const foRejected = foLeads.filter((l) => isRejectedStatus(l.status));
+          const foInProgress = foLeads.filter((l) => !isCompletedStatus(l.status) && !isRejectedStatus(l.status));
+          const foDisbursedAmt = foDisbursed.reduce((s, l) => s + Number(l.loanAmount || 0), 0);
+          const completionPct = foLeads.length > 0 ? Math.round((foCompleted.length / foLeads.length) * 100) : 0;
+          const targetAchievementPct =
+            foTargetAmount > 0
+              ? Math.min(999, Math.round((foDisbursedAmt / foTargetAmount) * 100))
+              : foTargetLeads > 0
+              ? Math.min(999, Math.round((foCompleted.length / foTargetLeads) * 100))
+              : 0;
+
+          return {
+            id: foId,
+            employeeCode: fo.employeeCode,
+            fullName: fo.fullName,
+            mobile: fo.mobile || '',
+            email: fo.email || '',
+            isActive: Boolean(fo.isActive),
+            serviceCity: fo.serviceCity || '',
+            servicePincodes: fo.servicePincodes || '',
+            referralCount: referrals.length,
+            maxReferralCount: HIERARCHY_LIMITS.REFERRALS_PER_FO,
+            activeReferralCount: referrals.filter((r) => r.isActive).length,
+            targetLeads: foTargetLeads,
+            targetAmount: foTargetAmount,
+            leadsAssigned: foLeads.length,
+            leadsInProgress: foInProgress.length,
+            leadsCompleted: foCompleted.length,
+            leadsDisbursed: foDisbursed.length,
+            leadsRejected: foRejected.length,
+            disbursedAmount: foDisbursedAmt,
+            completionPct,
+            targetAchievementPct,
+            enquiriesTotal: foEnquiries.length,
+            enquiriesOpen: foEnquiries.filter((e) => isOpenEnquiry(e.status)).length,
+            enquiriesResolved: foEnquiries.filter((e) => !isOpenEnquiry(e.status)).length,
+            enquiriesOverdue: foEnquiries.filter((e) => isOverdueEnquiry(e)).length,
+            referrals,
+            leads: foLeads.map((l) => ({
+              id: Number(l.id),
+              leadCode: l.leadCode,
+              customerName: l.customerName,
+              loanProduct: l.loanProduct,
+              loanAmount: Number(l.loanAmount || 0),
+              bankNbfc: l.bankNbfc,
+              status: l.status,
+              referralCode: l.referralId || '',
+              referralName: l.referralName || '',
+              createdBy: Number(l.createdBy),
+              createdAt: l.createdAt,
+              updatedAt: l.updatedAt,
+            })),
+            enquiries: foEnquiries.map((e) => ({
+              id: Number(e.id),
+              enquiryCode: e.enquiryCode,
+              leadId: e.leadId ? Number(e.leadId) : null,
+              leadCode: e.leadCode || '',
+              referralUserId: Number(e.referralUserId),
+              referralCode: e.referralCode || '',
+              referralName: e.referralName || '',
+              category: e.category,
+              description: e.description,
+              status: e.status,
+              solutionText: e.solutionText || '',
+              slaDeadlineAt: e.slaDeadlineAt,
+              isOverdue: isOverdueEnquiry(e),
+              createdAt: e.createdAt,
+              updatedAt: e.updatedAt,
+            })),
+          };
+        });
+
+        // Include any leads directly assigned to this TL (even if not yet assigned to an FO)
+        for (const l of allLeads) {
+          if (Number(l.assignedTlId) === tlId) {
+            tlLeadMap.set(Number(l.id), l);
+          }
+        }
+
+        const tlLeads = Array.from(tlLeadMap.values());
+        const tlEnquiries = Array.from(tlEnquiryMap.values());
+        const tlCompleted = tlLeads.filter((l) => isCompletedStatus(l.status));
+        const tlDisbursed = tlLeads.filter((l) => isDisbursedStatus(l.status));
+        const tlRejected = tlLeads.filter((l) => isRejectedStatus(l.status));
+        const tlInProgress = tlLeads.filter((l) => !isCompletedStatus(l.status) && !isRejectedStatus(l.status));
+        const tlDisbursedAmt = tlDisbursed.reduce((s, l) => s + Number(l.loanAmount || 0), 0);
+
+        const tlTarget = targetMap.get(tlId);
+        const tlTargetLeads = tlTarget?.targetLeads ?? 0;
+        const tlTargetAmount = tlTarget?.targetAmount ?? 0;
+        const completionPct = tlLeads.length > 0 ? Math.round((tlCompleted.length / tlLeads.length) * 100) : 0;
+        const targetAchievementPct =
+          tlTargetAmount > 0
+            ? Math.min(999, Math.round((tlDisbursedAmt / tlTargetAmount) * 100))
+            : tlTargetLeads > 0
+            ? Math.min(999, Math.round((tlCompleted.length / tlTargetLeads) * 100))
+            : 0;
+
+        return {
+          id: tlId,
+          employeeCode: tl.employeeCode,
+          fullName: tl.fullName,
+          mobile: tl.mobile || '',
+          email: tl.email || '',
+          isActive: Boolean(tl.isActive),
+          branchName: tl.branchName || '',
+          teamName: tl.teamName || '',
+          foCount: fieldOfficers.length,
+          maxFoCount: HIERARCHY_LIMITS.FIELD_OFFICERS_PER_TL,
+          activeFoCount: fieldOfficers.filter((f) => f.isActive).length,
+          referralCount: fieldOfficers.reduce((s, f) => s + f.referralCount, 0),
+          targetLeads: tlTargetLeads,
+          targetAmount: tlTargetAmount,
+          leadsAssigned: tlLeads.length,
+          leadsInProgress: tlInProgress.length,
+          leadsCompleted: tlCompleted.length,
+          leadsDisbursed: tlDisbursed.length,
+          leadsRejected: tlRejected.length,
+          disbursedAmount: tlDisbursedAmt,
+          completionPct,
+          targetAchievementPct,
+          enquiriesTotal: tlEnquiries.length,
+          enquiriesOpen: tlEnquiries.filter((e) => isOpenEnquiry(e.status)).length,
+          enquiriesResolved: tlEnquiries.filter((e) => !isOpenEnquiry(e.status)).length,
+          enquiriesOverdue: tlEnquiries.filter((e) => isOverdueEnquiry(e)).length,
+          fieldOfficers,
+        };
+      });
+
+      const totalLeadsAssigned = teamLeaders.reduce((s, t) => s + t.leadsAssigned, 0);
+      const totalLeadsCompleted = teamLeaders.reduce((s, t) => s + t.leadsCompleted, 0);
+      const totalLeadsInProgress = teamLeaders.reduce((s, t) => s + t.leadsInProgress, 0);
+      const totalDisbursedLeads = teamLeaders.reduce((s, t) => s + t.leadsDisbursed, 0);
+      const totalDisbursedAmount = teamLeaders.reduce((s, t) => s + t.disbursedAmount, 0);
+      const totalTargetLeads = teamLeaders.reduce((s, t) => s + t.targetLeads, 0);
+      const totalTargetAmount = teamLeaders.reduce((s, t) => s + t.targetAmount, 0);
+
+      res.json({
+        monthKey,
+        canAssignTargets: caller.role === 'SUPER_ADMIN' || caller.role === 'BRANCH_MANAGER',
+        branchManagers: caller.role === 'SUPER_ADMIN' ? allBms : selectedBm ? [selectedBm] : [],
+        selectedBm,
+        summary: {
+          totalTeamLeaders: teamLeaders.length,
+          maxTeamLeaders: HIERARCHY_LIMITS.TEAM_LEADERS_PER_BM,
+          activeTeamLeaders: teamLeaders.filter((t) => t.isActive).length,
+          totalFieldOfficers: teamLeaders.reduce((s, t) => s + t.foCount, 0),
+          maxFieldOfficers: HIERARCHY_LIMITS.TEAM_LEADERS_PER_BM * HIERARCHY_LIMITS.FIELD_OFFICERS_PER_TL,
+          activeFieldOfficers: teamLeaders.reduce((s, t) => s + t.activeFoCount, 0),
+          totalReferrals: teamLeaders.reduce((s, t) => s + t.referralCount, 0),
+          totalLeadsAssigned,
+          totalLeadsInProgress,
+          totalLeadsCompleted,
+          totalDisbursedLeads,
+          totalDisbursedAmount,
+          completionPct: totalLeadsAssigned > 0 ? Math.round((totalLeadsCompleted / totalLeadsAssigned) * 100) : 0,
+          totalTargetLeads,
+          totalTargetAmount,
+          achievementPct:
+            totalTargetAmount > 0
+              ? Math.min(999, Math.round((totalDisbursedAmount / totalTargetAmount) * 100))
+              : totalTargetLeads > 0
+              ? Math.min(999, Math.round((totalLeadsCompleted / totalTargetLeads) * 100))
+              : 0,
+          totalEnquiries: teamLeaders.reduce((s, t) => s + t.enquiriesTotal, 0),
+          openEnquiries: teamLeaders.reduce((s, t) => s + t.enquiriesOpen, 0),
+          resolvedEnquiries: teamLeaders.reduce((s, t) => s + t.enquiriesResolved, 0),
+          overdueEnquiries: teamLeaders.reduce((s, t) => s + t.enquiriesOverdue, 0),
+        },
+        teamLeaders,
+      });
+    }
+  );
+
+  router.post(
+    '/bm/assign-target',
+    requireAuth,
+    requireRoles('SUPER_ADMIN', 'BRANCH_MANAGER'),
+    (req: AuthedRequest, res) => {
+      const caller = req.user!;
+      const body = req.body as {
+        monthKey?: string;
+        userId?: number;
+        targetLeads?: number;
+        targetAmount?: number;
+        targets?: { userId: number; targetLeads: number; targetAmount: number }[];
+      };
+
+      const rawMonth = typeof body?.monthKey === 'string' ? body.monthKey.trim() : '';
+      const monthKey = /^\d{4}-\d{2}$/.test(rawMonth) ? rawMonth : new Date().toISOString().slice(0, 7);
+
+      const items = Array.isArray(body?.targets)
+        ? body.targets
+        : body?.userId
+        ? [
+            {
+              userId: Number(body.userId),
+              targetLeads: Number(body.targetLeads || 0),
+              targetAmount: Number(body.targetAmount || 0),
+            },
+          ]
+        : [];
+
+      if (items.length === 0) {
+        res.status(400).json({ error: 'At least one Team Leader or Field Officer target is required.' });
+        return;
+      }
+
+      // Compute allowed downline IDs for BM
+      let allowedDownlineIds: Set<number> | null = null;
+      if (caller.role === 'BRANCH_MANAGER') {
+        const myTls = db
+          .prepare(`SELECT id FROM users WHERE role = 'TEAM_LEADER' AND reports_to_user_id = ?`)
+          .all(caller.id) as { id: number }[];
+        const tlIdList = myTls.map((t) => Number(t.id));
+        const myFos =
+          tlIdList.length > 0
+            ? (db
+                .prepare(
+                  `SELECT id FROM users WHERE role = 'FIELD_OFFICER' AND reports_to_user_id IN (${tlIdList.map(() => '?').join(',')})`
+                )
+                .all(...tlIdList) as { id: number }[])
+            : [];
+        allowedDownlineIds = new Set<number>([...tlIdList, ...myFos.map((f) => Number(f.id))]);
+      }
+
+      let savedCount = 0;
+      for (const item of items) {
+        const targetUid = Number(item.userId);
+        if (!targetUid) continue;
+        if (allowedDownlineIds && !allowedDownlineIds.has(targetUid)) {
+          res.status(403).json({ error: 'You can only assign targets to Team Leaders & Field Officers mapped in your downline.' });
+          return;
+        }
+        const targetUser = db
+          .prepare(`SELECT id, employee_code, full_name, role, branch_id FROM users WHERE id = ?`)
+          .get(targetUid) as any;
+        if (!targetUser) continue;
+
+        const tLeads = Math.max(1, Math.min(5000, Math.round(Number(item.targetLeads || 10))));
+        const tAmt = Math.max(50000, Math.min(1000000000, Math.round(Number(item.targetAmount || 500000))));
+
+        const existing = db
+          .prepare(`SELECT id FROM sales_targets WHERE month_key = ? AND user_id = ?`)
+          .get(monthKey, targetUid) as { id: number } | undefined;
+
+        if (existing) {
+          db.prepare(`
+            UPDATE sales_targets
+            SET target_leads = ?, target_amount = ?, branch_id = ?, updated_at = datetime('now')
+            WHERE id = ?
+          `).run(tLeads, tAmt, targetUser.branch_id ?? null, existing.id);
+        } else {
+          db.prepare(`
+            INSERT INTO sales_targets (month_key, user_id, branch_id, target_leads, target_amount)
+            VALUES (?, ?, ?, ?, ?)
+          `).run(monthKey, targetUid, targetUser.branch_id ?? null, tLeads, tAmt);
+        }
+
+        createAlert({
+          userId: targetUid,
+          category: 'Lead Follow-up Alert',
+          titleEn: `Monthly Target Assigned (${monthKey})`,
+          titleHi: `मासिक टारगेट असाइन (${monthKey})`,
+          messageEn: `${caller.fullName} (${caller.employeeCode}) assigned you a target of ${tLeads} leads & ₹${tAmt.toLocaleString('en-IN')} for ${monthKey}.`,
+          messageHi: `${caller.fullName} (${caller.employeeCode}) ने ${monthKey} के लिए ${tLeads} लीड और ₹${tAmt.toLocaleString('en-IN')} का टारगेट दिया है।`,
+        });
+
+        savedCount += 1;
+      }
+
+      logAudit(
+        caller,
+        'BM_TARGET_ASSIGNED',
+        'TARGET',
+        monthKey,
+        `Assigned monthly targets for ${savedCount} downline team member(s)`
+      );
+      broadcastLiveSync('TARGET_ASSIGNED', `BM updated ${monthKey} targets for ${savedCount} team member(s)`, caller);
+      res.json({ ok: true, savedCount, monthKey });
+    }
+  );
+
   // Referral Payout Ledger & Leaderboard (Strict Referral Privacy Enforcement)
   router.get('/sales/referral-hub', requireAuth, (req: AuthedRequest, res) => {
     const user = req.user!;
@@ -7960,6 +8567,242 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     seedVerificationDatasetInternal(false);
     seedSalesExtensionsIfNeeded();
     res.json({ ok: true });
+  });
+
+  // ============================================================================
+  // FIREBASE CLOUD SYNC BRIDGE (SUPER ADMIN ONLY)
+  // ============================================================================
+  router.get('/admin/cloud-sync/export', requireAuth, requireRoles('SUPER_ADMIN'), (_req: AuthedRequest, res) => {
+    const branches = (
+      db
+        .prepare(`SELECT id, code, name, city, state, is_active FROM branches ORDER BY id ASC`)
+        .all() as any[]
+    ).map((b) => ({
+      code: String(b.code || '').trim().toUpperCase(),
+      name: String(b.name || '').trim(),
+      city: String(b.city || '').trim(),
+      state: String(b.state || '').trim(),
+      isActive: Boolean(b.is_active),
+    }));
+
+    const branchIdToCode = new Map<number, string>();
+    const branchRows = db.prepare(`SELECT id, code FROM branches`).all() as { id: number; code: string }[];
+    for (const b of branchRows) {
+      branchIdToCode.set(Number(b.id), String(b.code || '').trim().toUpperCase());
+    }
+
+    const teamIdToName = new Map<number, string>();
+    const teamRows = db.prepare(`SELECT id, name FROM teams`).all() as { id: number; name: string }[];
+    for (const t of teamRows) {
+      teamIdToName.set(Number(t.id), String(t.name || '').trim());
+    }
+
+    const userIdToCode = new Map<number, string>();
+    const allUserCodes = db.prepare(`SELECT id, employee_code FROM users`).all() as { id: number; employee_code: string }[];
+    for (const u of allUserCodes) {
+      userIdToCode.set(Number(u.id), String(u.employee_code || '').trim().toUpperCase());
+    }
+
+    const employees = (
+      db
+        .prepare(`
+          SELECT employee_code, full_name, mobile, email, password_hash, admin_saved_password_enc,
+                 role, branch_id, team_id, reports_to_user_id, referral_code, service_city,
+                 service_pincodes, is_active, otp_enabled, preferred_lang
+          FROM users
+          ORDER BY id ASC
+        `)
+        .all() as any[]
+    ).map((u) => ({
+      employeeCode: String(u.employee_code || '').trim().replace(/\s+/g, '').toUpperCase(),
+      fullName: String(u.full_name || u.employee_code || '').trim(),
+      mobile: String(u.mobile || '').trim(),
+      email: String(u.email || '').trim(),
+      passwordHash: String(u.password_hash || ''),
+      adminSavedPasswordEnc: String(u.admin_saved_password_enc || ''),
+      role: String(u.role || 'FIELD_OFFICER'),
+      branchCode: u.branch_id ? branchIdToCode.get(Number(u.branch_id)) || '' : '',
+      teamName: u.team_id ? teamIdToName.get(Number(u.team_id)) || '' : '',
+      reportsToEmployeeCode: u.reports_to_user_id ? userIdToCode.get(Number(u.reports_to_user_id)) || '' : '',
+      referralCode: String(u.referral_code || '').trim(),
+      serviceCity: String(u.service_city || '').trim(),
+      servicePincodes: String(u.service_pincodes || '').trim(),
+      isActive: Boolean(u.is_active),
+      otpEnabled: Boolean(u.otp_enabled),
+      preferredLang: u.preferred_lang === 'hi' ? 'hi' : 'en',
+    }));
+
+    const currentSettings = getSettings();
+    const settings = [
+      {
+        settingKey: 'global',
+        officeName: String(currentSettings.officeName || 'AMBIKA ASSOCIATE Head Office'),
+        officeAddress: String(currentSettings.officeAddress || ''),
+        petrolRatePerKm: Number(currentSettings.petrolRatePerKm ?? 3),
+        attendanceCutoffTime: String(currentSettings.attendanceCutoffTime || '10:30'),
+        attendanceLatePenaltyInr: Number(currentSettings.attendanceLatePenaltyInr ?? 20),
+        unapprovedLeavePenaltyInr: Number(currentSettings.unapprovedLeavePenaltyInr ?? 100),
+        defaultLanguage: currentSettings.defaultLanguage === 'hi' ? 'hi' : 'en',
+      },
+    ];
+
+    res.json({ branches, employees, settings });
+  });
+
+  router.post('/admin/cloud-sync/restore', requireAuth, requireRoles('SUPER_ADMIN'), (req: AuthedRequest, res) => {
+    const admin = req.user!;
+    const body = req.body as {
+      branches?: any[];
+      employees?: any[];
+      settings?: any[];
+    };
+
+    const cloudBranches = Array.isArray(body?.branches) ? body.branches : [];
+    const cloudEmployees = Array.isArray(body?.employees) ? body.employees : [];
+
+    let restoredBranches = 0;
+    const branchCodeToId = new Map<string, number>();
+    const existingBranches = db.prepare(`SELECT id, code FROM branches`).all() as { id: number; code: string }[];
+    for (const b of existingBranches) {
+      branchCodeToId.set(String(b.code || '').trim().toUpperCase(), Number(b.id));
+    }
+
+    const insertBranch = db.prepare(`
+      INSERT OR IGNORE INTO branches (code, name, city, state, is_active)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    for (const cb of cloudBranches) {
+      const code = String(cb?.code || '').trim().replace(/\s+/g, '').toUpperCase();
+      if (!code || branchCodeToId.has(code)) continue;
+      const result = insertBranch.run(
+        code,
+        String(cb?.name || code).trim(),
+        String(cb?.city || '').trim(),
+        String(cb?.state || '').trim(),
+        cb?.isActive === false ? 0 : 1
+      );
+      if (result.changes > 0) {
+        restoredBranches += 1;
+        branchCodeToId.set(code, Number(result.lastInsertRowid));
+      }
+    }
+
+    const defaultBranch = db.prepare(`SELECT id FROM branches ORDER BY id ASC LIMIT 1`).get() as { id: number } | undefined;
+    const existingUsers = db
+      .prepare(`SELECT id, UPPER(REPLACE(employee_code, ' ', '')) as code, admin_saved_password_enc FROM users`)
+      .all() as { id: number; code: string; admin_saved_password_enc: string | null }[];
+    const existingCodeMap = new Map<string, { id: number; hasSavedPass: boolean }>();
+    for (const u of existingUsers) {
+      existingCodeMap.set(u.code, { id: Number(u.id), hasSavedPass: Boolean(u.admin_saved_password_enc) });
+    }
+
+    const insertUser = db.prepare(`
+      INSERT OR IGNORE INTO users (
+        employee_code, full_name, mobile, email, password_hash, admin_saved_password_enc,
+        role, branch_id, team_id, referral_code, is_active, otp_enabled,
+        gps_consent, camera_consent, preferred_lang, service_city, service_pincodes,
+        reports_to_user_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 1, 1, ?, ?, ?, NULL)
+    `);
+
+    let restoredEmployees = 0;
+    const pendingParentLinks: { employeeCode: string; parentCode: string }[] = [];
+
+    for (const ce of cloudEmployees) {
+      const cleanCode = String(ce?.employeeCode || '').trim().replace(/\s+/g, '').toUpperCase();
+      if (!cleanCode || cleanCode.length < 2) continue;
+      const passwordHash = String(ce?.passwordHash || '').trim();
+      if (passwordHash.length < 10) continue;
+
+      const existingEntry = existingCodeMap.get(cleanCode);
+      if (existingEntry) {
+        // Hydrate encrypted admin saved password if missing locally
+        if (!existingEntry.hasSavedPass && ce?.adminSavedPasswordEnc) {
+          db.prepare(`UPDATE users SET admin_saved_password_enc = ? WHERE id = ?`).run(
+            String(ce.adminSavedPasswordEnc),
+            existingEntry.id
+          );
+        }
+        continue;
+      }
+
+      const role = VALID_USER_ROLES.includes(ce?.role) ? ce.role : 'FIELD_OFFICER';
+      const bCode = String(ce?.branchCode || '').trim().toUpperCase();
+      const branchId = (bCode ? branchCodeToId.get(bCode) : undefined) ?? defaultBranch?.id ?? null;
+      const rawRef = String(ce?.referralCode || '').trim();
+      let safeRef: string | null = rawRef || null;
+      if (safeRef) {
+        const refConflict = db
+          .prepare(`SELECT id FROM users WHERE UPPER(referral_code) = UPPER(?)`)
+          .get(safeRef);
+        if (refConflict) safeRef = null;
+      }
+
+      try {
+        const ins = insertUser.run(
+          cleanCode,
+          String(ce?.fullName || cleanCode).trim(),
+          String(ce?.mobile || '').trim(),
+          String(ce?.email || `${cleanCode.toLowerCase()}@ambikaassociate.in`).trim(),
+          passwordHash,
+          ce?.adminSavedPasswordEnc ? String(ce.adminSavedPasswordEnc) : null,
+          role,
+          branchId,
+          safeRef,
+          ce?.isActive === false ? 0 : 1,
+          ce?.otpEnabled ? 1 : 0,
+          ce?.preferredLang === 'hi' ? 'hi' : 'en',
+          ce?.serviceCity ? String(ce.serviceCity).trim() : null,
+          ce?.servicePincodes ? String(ce.servicePincodes).trim() : null
+        );
+        if (ins.changes > 0) {
+          restoredEmployees += 1;
+          existingCodeMap.set(cleanCode, {
+            id: Number(ins.lastInsertRowid),
+            hasSavedPass: Boolean(ce?.adminSavedPasswordEnc),
+          });
+          if (ce?.reportsToEmployeeCode) {
+            pendingParentLinks.push({
+              employeeCode: cleanCode,
+              parentCode: String(ce.reportsToEmployeeCode).trim().toUpperCase(),
+            });
+          }
+        }
+      } catch {
+        // skip conflicting duplicate constraint rows cleanly
+      }
+    }
+
+    for (const link of pendingParentLinks) {
+      const parent = db
+        .prepare(`SELECT id FROM users WHERE UPPER(employee_code) = UPPER(?)`)
+        .get(link.parentCode) as { id: number } | undefined;
+      if (parent) {
+        db.prepare(`UPDATE users SET reports_to_user_id = ? WHERE UPPER(employee_code) = UPPER(?) AND reports_to_user_id IS NULL`).run(
+          parent.id,
+          link.employeeCode
+        );
+      }
+    }
+
+    if (restoredEmployees > 0 || restoredBranches > 0) {
+      syncUsersBackupToDisk();
+      logAudit(
+        admin,
+        'CLOUD_SYNC_RESTORED',
+        'SYSTEM',
+        'FIRESTORE',
+        `Restored ${restoredEmployees} employee ID(s) and ${restoredBranches} branch(es) from Google Cloud Firestore`
+      );
+    }
+
+    const totalUsersRow = db.prepare(`SELECT COUNT(*) as cnt FROM users`).get() as { cnt: number };
+    res.json({
+      ok: true,
+      restoredEmployees,
+      restoredBranches,
+      totalUsers: Number(totalUsersRow?.cnt ?? 0),
+    });
   });
 
   // ============================================================================

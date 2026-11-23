@@ -17,7 +17,13 @@ import {
   ShieldCheck,
   Users,
   Pencil,
+  Cloud,
+  CloudOff,
+  RefreshCw,
+  LogOut,
+  CheckCircle2,
 } from 'lucide-react';
+import type { User as FirebaseUser } from 'firebase/auth';
 import {
   HIERARCHY_LIMITS,
   USER_ROLES,
@@ -26,6 +32,18 @@ import {
   type UserRole,
 } from '../../shared/types';
 import { apiFetch, formatDateTime, getStoredToken } from '../lib/api';
+import {
+  subscribeCloudAuth,
+  signInCloudAdmin,
+  signOutCloudAdmin,
+  ensureAdminProfile,
+  fetchCloudSnapshot,
+  pushFullSnapshotToCloud,
+  deleteEmployeeFromCloud,
+  isAuthorizedAdminEmail,
+  type CloudSnapshot,
+} from '../lib/firebase';
+import { CloudErrorBoundary } from './CloudErrorBoundary';
 
 interface AdminSettingsProps {
   user: AuthUser;
@@ -62,7 +80,7 @@ function generateClientPassword(length = 8): string {
   return out;
 }
 
-export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
+const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
   user,
   settings,
   activeOption,
@@ -91,6 +109,7 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
   // Admin Console Employee ID & Password Studio
   const [showCreatePanel, setShowCreatePanel] = useState(true);
   const [createMode, setCreateMode] = useState<'single' | 'bulk'>('single');
+  const [autoGenerateCreds, setAutoGenerateCreds] = useState(true);
   const [keepCreatingMore, setKeepCreatingMore] = useState(true);
   const [showPassword, setShowPassword] = useState(true);
   const [creatingUsers, setCreatingUsers] = useState(false);
@@ -125,8 +144,28 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
 
   const [generatedCredentials, setGeneratedCredentials] = useState<
     { employeeCode: string; password: string; fullName: string; role: string }[]
-  >([]);
+  >(() => {
+    try {
+      const saved = window.localStorage.getItem('ambika_admin_recent_creds_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) return parsed;
+      }
+    } catch {
+      // ignore localStorage read errors
+    }
+    return [];
+  });
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
+  const [revealedPasswordIds, setRevealedPasswordIds] = useState<Record<number, boolean>>({});
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('ambika_admin_recent_creds_v1', JSON.stringify(generatedCredentials.slice(0, 100)));
+    } catch {
+      // ignore localStorage quota errors
+    }
+  }, [generatedCredentials]);
 
   // Search, filter, and password reset on Login ID directory
   const [userSearch, setUserSearch] = useState('');
@@ -147,6 +186,14 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
   // Org forms
   const [newBranch, setNewBranch] = useState({ code: '', name: '', city: '', state: '' });
   const [newTeam, setNewTeam] = useState({ branchId: '1', name: '' });
+
+  // Permanent Firebase Cloud Database Sync state (Super Admin)
+  const [cloudUser, setCloudUser] = useState<FirebaseUser | null>(null);
+  const [cloudSyncing, setCloudSyncing] = useState(false);
+  const [cloudEmployeeCount, setCloudEmployeeCount] = useState<number | null>(null);
+  const [lastCloudSyncAt, setLastCloudSyncAt] = useState<string | null>(null);
+  const [cloudError, setCloudError] = useState<string | null>(null);
+  const initialCloudSyncDoneRef = useRef(false);
 
   const isSuperAdmin = user.role === 'SUPER_ADMIN';
 
@@ -220,10 +267,24 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
     setBranches(dRes.branches || []);
     setTeams(dRes.teams || []);
     setAuditLogs(aRes.logs);
-    setNewUser((prev) => ({
-      ...prev,
-      reportsToUserId: prev.reportsToUserId || pickDefaultParentId(prev.role, uRes.users),
-    }));
+    setNewUser((prev) => {
+      const nextCode =
+        autoGenerateCreds && !prev.employeeCode
+          ? suggestNextEmployeeCode(prev.role, uRes.users)
+          : prev.employeeCode;
+      const nextPass =
+        autoGenerateCreds && !prev.password ? generateClientPassword(8) : prev.password;
+      return {
+        ...prev,
+        employeeCode: nextCode,
+        password: nextPass,
+        referralCode:
+          autoGenerateCreds && prev.role === 'REFERRAL_PARTNER' && !prev.referralCode && nextCode
+            ? `DSA-${nextCode}`
+            : prev.referralCode,
+        reportsToUserId: prev.reportsToUserId || pickDefaultParentId(prev.role, uRes.users),
+      };
+    });
     setBulkForm((prev) => ({
       ...prev,
       reportsToUserId: prev.reportsToUserId || pickDefaultParentId(prev.role, uRes.users),
@@ -239,6 +300,158 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
     setRules(settings);
   }, [settings]);
 
+  const formatCloudError = (err: unknown): string => {
+    const raw = err instanceof Error ? err.message : String(err || 'Cloud sync failed');
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.error === 'string') {
+        return `Cloud sync (${parsed.operationType || 'write'} · ${parsed.path || 'firestore'}): ${parsed.error}`;
+      }
+    } catch {
+      // plain error string
+    }
+    return raw;
+  };
+
+  const runBiDirectionalCloudSync = async (
+    fbUser: FirebaseUser,
+    options: { showToast?: boolean } = {}
+  ) => {
+    if (!isSuperAdmin) return;
+    setCloudSyncing(true);
+    setCloudError(null);
+    try {
+      await ensureAdminProfile(fbUser);
+
+      // 1. Pull any existing Employee IDs & Branches from Google Cloud Firestore
+      const cloudSnap = await fetchCloudSnapshot();
+      let restoredEmployees = 0;
+      let restoredBranches = 0;
+      if (cloudSnap.employees.length > 0 || cloudSnap.branches.length > 0) {
+        const restoreRes = await apiFetch<{
+          ok: boolean;
+          restoredEmployees: number;
+          restoredBranches: number;
+          totalUsers: number;
+        }>('/admin/cloud-sync/restore', {
+          method: 'POST',
+          json: cloudSnap,
+        });
+        restoredEmployees = restoreRes.restoredEmployees || 0;
+        restoredBranches = restoreRes.restoredBranches || 0;
+      }
+
+      // 2. Push the complete merged SQLite directory (all manual/auto IDs + encrypted passwords) back to Firestore
+      const localExport = await apiFetch<CloudSnapshot>('/admin/cloud-sync/export');
+      const pushRes = await pushFullSnapshotToCloud(localExport);
+
+      setCloudEmployeeCount(pushRes.syncedEmployees);
+      setLastCloudSyncAt(new Date().toISOString());
+
+      if (restoredEmployees > 0 || restoredBranches > 0) {
+        await loadAll();
+      }
+      if (options.showToast) {
+        setMsg(
+          restoredEmployees > 0
+            ? `Cloud Database synced: restored ${restoredEmployees} Employee ID(s) from Google Cloud and backed up all ${pushRes.syncedEmployees} IDs permanently.`
+            : `Cloud Database synced permanently: all ${pushRes.syncedEmployees} Employee IDs & Passwords saved safely in Google Firestore.`
+        );
+      }
+    } catch (err) {
+      setCloudError(formatCloudError(err));
+    } finally {
+      setCloudSyncing(false);
+    }
+  };
+
+  const mirrorChangesToCloud = async (deletedOldEmployeeCode?: string) => {
+    if (!isSuperAdmin || !cloudUser) return;
+    setCloudSyncing(true);
+    setCloudError(null);
+    try {
+      if (deletedOldEmployeeCode) {
+        await deleteEmployeeFromCloud(deletedOldEmployeeCode);
+      }
+      const localExport = await apiFetch<CloudSnapshot>('/admin/cloud-sync/export');
+      const pushRes = await pushFullSnapshotToCloud(localExport);
+      setCloudEmployeeCount(pushRes.syncedEmployees);
+      setLastCloudSyncAt(new Date().toISOString());
+    } catch (err) {
+      setCloudError(formatCloudError(err));
+    } finally {
+      setCloudSyncing(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isSuperAdmin) return;
+    const unsubscribe = subscribeCloudAuth((fbUser) => {
+      setCloudUser(fbUser);
+      if (fbUser && isAuthorizedAdminEmail(fbUser.email) && !initialCloudSyncDoneRef.current) {
+        initialCloudSyncDoneRef.current = true;
+        void runBiDirectionalCloudSync(fbUser, { showToast: false });
+      }
+      if (!fbUser) {
+        initialCloudSyncDoneRef.current = false;
+      }
+    });
+    return () => unsubscribe();
+  }, [isSuperAdmin]);
+
+  const handleConnectCloudDatabase = async () => {
+    setCloudError(null);
+    setMsg(null);
+    setCloudSyncing(true);
+    try {
+      const fbUser = await signInCloudAdmin();
+      setCloudUser(fbUser);
+      initialCloudSyncDoneRef.current = true;
+      await runBiDirectionalCloudSync(fbUser, { showToast: true });
+    } catch (err) {
+      setCloudError(formatCloudError(err));
+      setCloudSyncing(false);
+    }
+  };
+
+  const handleDisconnectCloudDatabase = async () => {
+    setCloudError(null);
+    try {
+      await signOutCloudAdmin();
+      setCloudUser(null);
+      setCloudEmployeeCount(null);
+      setLastCloudSyncAt(null);
+      setMsg('Disconnected Google Cloud sync session on this browser.');
+    } catch (err) {
+      setCloudError(formatCloudError(err));
+    }
+  };
+
+  const handleToggleAutoGenerateCreds = (nextAuto: boolean) => {
+    setAutoGenerateCreds(nextAuto);
+    setErrorMsg(null);
+    if (nextAuto) {
+      setNewUser((prev) => {
+        const generatedCode = suggestNextEmployeeCode(prev.role, users);
+        return {
+          ...prev,
+          employeeCode: generatedCode,
+          password: generateClientPassword(8),
+          referralCode:
+            prev.role === 'REFERRAL_PARTNER' ? `DSA-${generatedCode}` : prev.referralCode,
+        };
+      });
+    } else {
+      setNewUser((prev) => ({
+        ...prev,
+        employeeCode: '',
+        password: '',
+        referralCode: prev.role === 'REFERRAL_PARTNER' ? '' : prev.referralCode,
+      }));
+      window.requestAnimationFrame(() => employeeCodeInputRef.current?.focus());
+    }
+  };
+
   const applyRolePreset = (targetRole: UserRole, mode: 'single' | 'bulk' = createMode) => {
     setSubTab('users');
     onSelectOption?.('users');
@@ -249,14 +462,21 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
     const parentObj = users.find((u) => String(u.id) === defaultParentId);
 
     if (mode === 'single') {
-      setNewUser((prev) => ({
-        ...prev,
-        role: targetRole,
-        employeeCode: suggestNextEmployeeCode(targetRole, users),
-        password: prev.password || generateClientPassword(8),
-        reportsToUserId: defaultParentId,
-        branchId: parentObj?.branchId ? String(parentObj.branchId) : prev.branchId,
-      }));
+      setNewUser((prev) => {
+        const autoCode = autoGenerateCreds ? suggestNextEmployeeCode(targetRole, users) : prev.employeeCode;
+        return {
+          ...prev,
+          role: targetRole,
+          employeeCode: autoCode,
+          password: autoGenerateCreds ? prev.password || generateClientPassword(8) : prev.password,
+          referralCode:
+            autoGenerateCreds && targetRole === 'REFERRAL_PARTNER'
+              ? `DSA-${autoCode}`
+              : prev.referralCode,
+          reportsToUserId: defaultParentId,
+          branchId: parentObj?.branchId ? String(parentObj.branchId) : prev.branchId,
+        };
+      });
       window.requestAnimationFrame(() => employeeCodeInputRef.current?.focus());
     } else {
       setBulkForm((prev) => ({
@@ -275,13 +495,18 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
     onSelectOption?.('users');
     setShowCreatePanel(true);
     setErrorMsg(null);
-    if (!newUser.employeeCode) {
-      setNewUser((prev) => ({
-        ...prev,
-        employeeCode: suggestNextEmployeeCode(prev.role, users),
-        password: prev.password || generateClientPassword(8),
-        reportsToUserId: prev.reportsToUserId || pickDefaultParentId(prev.role, users),
-      }));
+    if (autoGenerateCreds && !newUser.employeeCode) {
+      setNewUser((prev) => {
+        const autoCode = suggestNextEmployeeCode(prev.role, users);
+        return {
+          ...prev,
+          employeeCode: autoCode,
+          password: prev.password || generateClientPassword(8),
+          referralCode:
+            prev.role === 'REFERRAL_PARTNER' && !prev.referralCode ? `DSA-${autoCode}` : prev.referralCode,
+          reportsToUserId: prev.reportsToUserId || pickDefaultParentId(prev.role, users),
+        };
+      });
     }
     window.requestAnimationFrame(() => employeeCodeInputRef.current?.focus());
   };
@@ -353,19 +578,37 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
         },
         ...prev,
       ]);
-      setNewUser((prev) => ({
-        ...prev,
-        employeeCode: keepCreatingMore ? suggestNextEmployeeCode(prev.role, freshUsers) : '',
-        fullName: '',
-        mobile: '',
-        email: '',
-        password: keepCreatingMore ? generateClientPassword(8) : '',
-        reportsToUserId: pickDefaultParentId(prev.role, freshUsers),
-        referralCode: '',
-      }));
-      setMsg(`Employee Login ID "${finalCode}" created (Status: ON). Ready to sign in with password "${finalPass}".`);
+      setNewUser((prev) => {
+        const nextAutoCode =
+          keepCreatingMore && autoGenerateCreds
+            ? suggestNextEmployeeCode(prev.role, freshUsers)
+            : '';
+        return {
+          ...prev,
+          employeeCode: nextAutoCode,
+          fullName: '',
+          mobile: '',
+          email: '',
+          password: keepCreatingMore && autoGenerateCreds ? generateClientPassword(8) : '',
+          reportsToUserId: pickDefaultParentId(prev.role, freshUsers),
+          referralCode:
+            keepCreatingMore && autoGenerateCreds && prev.role === 'REFERRAL_PARTNER' && nextAutoCode
+              ? `DSA-${nextAutoCode}`
+              : '',
+        };
+      });
+      setUserSearch('');
+      setStatusFilter('ALL');
+      setMsg(
+        `Employee Login ID "${finalCode}" permanently saved (Status: ON)${
+          cloudUser ? ' & synced to Google Cloud' : ''
+        }. Ready to sign in with password "${finalPass}".`
+      );
+      void mirrorChangesToCloud();
       if (!keepCreatingMore) {
         setShowCreatePanel(false);
+      } else if (!autoGenerateCreds) {
+        window.requestAnimationFrame(() => employeeCodeInputRef.current?.focus());
       }
     } catch (err: any) {
       setErrorMsg(err.message || 'Could not create Employee ID & Password');
@@ -393,9 +636,12 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
       });
       setGeneratedCredentials((prev) => [...res.created, ...prev]);
       setMsg(
-        `Generated ${res.count} Employee Login ID${res.count > 1 ? 's' : ''} & Password${res.count > 1 ? 's' : ''} successfully.`
+        `Generated ${res.count} Employee Login ID${res.count > 1 ? 's' : ''} & Password${res.count > 1 ? 's' : ''} successfully${
+          cloudUser ? ' and synced to Google Cloud' : ''
+        }.`
       );
       await loadAll();
+      void mirrorChangesToCloud();
     } catch (err: any) {
       setErrorMsg(err.message || 'Could not generate batch Employee IDs');
     } finally {
@@ -414,6 +660,7 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
       setEditingTerritoryId(null);
       setMsg('Officer geographical territory updated.');
       await loadAll();
+      void mirrorChangesToCloud();
     } catch (err: any) {
       setErrorMsg(err.message || 'Could not update territory');
     }
@@ -436,6 +683,7 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
           : `Login ID ${target.employeeCode} (${target.fullName}) turned OFF — user logged out & blocked.`
       );
       await loadAll();
+      void mirrorChangesToCloud();
     } catch (err: any) {
       setErrorMsg(err.message || 'Could not update Login ID status');
     } finally {
@@ -470,6 +718,7 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
       setResetPasswordDraft('');
       setMsg(`Password updated for Employee ID ${target.employeeCode}.`);
       await loadAll();
+      void mirrorChangesToCloud();
     } catch (err: any) {
       setErrorMsg(err.message || 'Could not reset password');
     }
@@ -503,6 +752,8 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
         }.`
       );
       await loadAll();
+      const oldCode = String(target.employeeCode || '').trim().toUpperCase();
+      void mirrorChangesToCloud(oldCode && oldCode !== cleanCode ? oldCode : undefined);
     } catch (err: any) {
       setErrorMsg(err.message || 'Could not rename Employee / Referral ID');
     } finally {
@@ -520,6 +771,7 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
         json: { otpEnabled: !target.otpEnabled },
       });
       await loadAll();
+      void mirrorChangesToCloud();
     } catch (err: any) {
       setErrorMsg(err.message || 'Could not update OTP requirement');
     }
@@ -554,6 +806,7 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
       setMsg(
         `Configuration saved & synced live (v${res.settings.configVersion ?? 1}) to all connected BM, Team Leader, Back Office & Field Officer apps.`
       );
+      void mirrorChangesToCloud();
     } catch (err: any) {
       setMsg(`Error: ${err.message || 'Could not save settings'}`);
     }
@@ -619,6 +872,7 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
     setNewBranch({ code: '', name: '', city: '', state: '' });
     setMsg('Branch added.');
     await loadAll();
+    void mirrorChangesToCloud();
   };
 
   const createTeam = async (e: React.FormEvent) => {
@@ -721,6 +975,107 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
 
       {subTab === 'users' && (
         <div className="space-y-5">
+          {/* Permanent Google Cloud Firestore Sync Panel (Super Admin Only) */}
+          {isSuperAdmin && (
+            <div
+              className={`rounded-xl border p-4 transition-colors ${
+                cloudUser
+                  ? 'bg-emerald-50/70 border-emerald-200'
+                  : 'bg-[#0F2744] text-white border-[#0F2744]'
+              }`}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <div
+                    className={`w-9 h-9 rounded-lg flex items-center justify-center shrink-0 ${
+                      cloudUser ? 'bg-emerald-600 text-white' : 'bg-[#EA580C] text-white'
+                    }`}
+                  >
+                    {cloudUser ? <Cloud className="w-4 h-4" /> : <CloudOff className="w-4 h-4" />}
+                  </div>
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h2
+                        className={`text-sm font-display font-bold ${
+                          cloudUser ? 'text-[#0F2744]' : 'text-white'
+                        }`}
+                      >
+                        Permanent Cloud Database (Google Firestore)
+                      </h2>
+                      {cloudUser && (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 text-[11px] font-semibold">
+                          <CheckCircle2 className="w-3 h-3" />
+                          Connected &amp; Auto-Syncing
+                        </span>
+                      )}
+                    </div>
+                    {cloudUser ? (
+                      <p className="text-xs text-slate-700 mt-0.5">
+                        Signed in as <strong>{cloudUser.email}</strong>
+                        {cloudEmployeeCount !== null ? ` · ${cloudEmployeeCount} Employee IDs saved in Cloud` : ''}
+                        {lastCloudSyncAt ? ` · Last synced ${formatDateTime(lastCloudSyncAt)}` : ''}
+                      </p>
+                    ) : (
+                      <p className="text-xs text-slate-200 mt-0.5 max-w-2xl">
+                        Sign in once with your Admin Google Account (<strong>rajadineshgupta0@gmail.com</strong> or{' '}
+                        <strong>ambikafinance.info@gmail.com</strong>) so every manual/auto Employee ID &amp; Password stays
+                        permanently saved in Google Cloud and auto-restores across restarts &amp; republishes.
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {cloudUser ? (
+                    <>
+                      <button
+                        type="button"
+                        disabled={cloudSyncing}
+                        onClick={() => void runBiDirectionalCloudSync(cloudUser, { showToast: true })}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#0F2744] hover:bg-[#16365D] disabled:opacity-60 text-white text-xs font-semibold"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${cloudSyncing ? 'animate-spin' : ''}`} />
+                        {cloudSyncing ? 'Syncing…' : 'Sync & Restore Now'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={cloudSyncing}
+                        onClick={() => void handleDisconnectCloudDatabase()}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 text-xs font-semibold"
+                      >
+                        <LogOut className="w-3.5 h-3.5" />
+                        Disconnect
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={cloudSyncing}
+                      onClick={() => void handleConnectCloudDatabase()}
+                      className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-[#EA580C] hover:bg-[#C2410C] disabled:opacity-60 text-white text-xs font-bold shadow-xs"
+                    >
+                      <Cloud className="w-4 h-4" />
+                      {cloudSyncing ? 'Connecting…' : 'Connect Cloud Database (Google Sign-In)'}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {cloudError && (
+                <div className="mt-3 p-2.5 rounded-lg bg-red-50 border border-red-200 text-xs text-red-800 flex items-center justify-between gap-2">
+                  <span className="break-words">{cloudError}</span>
+                  <button
+                    type="button"
+                    onClick={() => setCloudError(null)}
+                    className="text-[11px] font-bold underline shrink-0"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
           {/* Login ID Access Control KPI Strip */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div className="bg-white border border-slate-200 rounded-xl p-4 flex items-center justify-between">
@@ -840,14 +1195,94 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
 
               {createMode === 'single' ? (
                 <form onSubmit={handleCreateUser} className="space-y-3">
+                  {/* Auto Generate Employee Login ID & Password ON / OFF Switch Bar */}
+                  <div
+                    className={`rounded-xl border px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-3 transition-colors ${
+                      autoGenerateCreds
+                        ? 'bg-emerald-50/70 border-emerald-200'
+                        : 'bg-slate-50 border-[#0F2744]/25'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 text-xs font-display font-bold text-[#0F2744]">
+                        {autoGenerateCreds ? (
+                          <Sparkles className="w-3.5 h-3.5 text-[#15803D] shrink-0" />
+                        ) : (
+                          <Pencil className="w-3.5 h-3.5 text-[#EA580C] shrink-0" />
+                        )}
+                        <span>
+                          Auto Employee Login ID &amp; Password Generate:{' '}
+                          <span className={autoGenerateCreds ? 'text-[#15803D]' : 'text-[#EA580C]'}>
+                            {autoGenerateCreds ? 'ON' : 'OFF (Manual Mode)'}
+                          </span>
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-600 mt-0.5">
+                        {autoGenerateCreds
+                          ? 'Auto Mode ON — Employee Login ID & Password are auto-generated for the selected role. Turn OFF anytime to type a custom manual ID & Password.'
+                          : 'Manual Mode Active — Enter any custom Employee Login ID & custom Password manually for any employee or partner role.'}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      {autoGenerateCreds && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setNewUser((prev) => {
+                              const nextCode = suggestNextEmployeeCode(prev.role, users);
+                              return {
+                                ...prev,
+                                employeeCode: nextCode,
+                                password: generateClientPassword(8),
+                                referralCode:
+                                  prev.role === 'REFERRAL_PARTNER' ? `DSA-${nextCode}` : prev.referralCode,
+                              };
+                            })
+                          }
+                          className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white border border-emerald-300 text-[#15803D] hover:bg-emerald-50 text-[11px] font-semibold"
+                        >
+                          <RotateCcw className="w-3 h-3" />
+                          Re-Generate Both
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={autoGenerateCreds}
+                        onClick={() => handleToggleAutoGenerateCreds(!autoGenerateCreds)}
+                        className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors shadow-xs ${
+                          autoGenerateCreds
+                            ? 'bg-[#15803D] hover:bg-green-800 text-white'
+                            : 'bg-[#0F2744] hover:bg-[#16365D] text-white'
+                        }`}
+                      >
+                        <span
+                          className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
+                            autoGenerateCreds ? 'bg-white/30' : 'bg-white/20'
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                              autoGenerateCreds ? 'translate-x-3.5' : 'translate-x-0.5'
+                            }`}
+                          />
+                        </span>
+                        <span>{autoGenerateCreds ? 'Auto Generate: ON' : 'Auto Generate: OFF'}</span>
+                      </button>
+                    </div>
+                  </div>
+
                   <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                     <div>
                       <div className="flex items-center justify-between gap-1 mb-1">
-                        <label className="text-[11px] font-semibold text-slate-700">Employee Login ID *</label>
+                        <label className="text-[11px] font-semibold text-slate-700">
+                          {autoGenerateCreds ? 'Employee Login ID (Auto / Editable) *' : 'Manual Employee Login ID *'}
+                        </label>
                         <div className="inline-flex items-center gap-2">
                           <button
                             type="button"
                             onClick={() => {
+                              setAutoGenerateCreds(false);
                               setNewUser((prev) => ({ ...prev, employeeCode: '' }));
                               window.requestAnimationFrame(() => employeeCodeInputRef.current?.focus());
                             }}
@@ -885,24 +1320,47 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                             employeeCode: e.target.value.replace(/\s+/g, '').toUpperCase(),
                           })
                         }
-                        placeholder="Type manual ID (e.g. BM_SATNA1) or click Auto ID"
-                        className="w-full px-3 py-2 text-xs font-mono border border-slate-300 rounded-lg"
+                        placeholder={
+                          autoGenerateCreds
+                            ? 'Auto-generated ID (editable)'
+                            : 'Type manual ID (e.g. SATNA-FO01, TLPALAK)'
+                        }
+                        className={`w-full px-3 py-2 text-xs font-mono border rounded-lg ${
+                          autoGenerateCreds
+                            ? 'border-emerald-300 bg-emerald-50/30'
+                            : 'border-[#0F2744]/40 bg-white'
+                        }`}
                       />
                     </div>
 
                     <div>
-                      <div className="flex items-center justify-between mb-1">
-                        <label className="text-[11px] font-semibold text-slate-700">Login Password *</label>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setNewUser((prev) => ({ ...prev, password: generateClientPassword(8) }))
-                          }
-                          className="inline-flex items-center gap-1 text-[10px] font-semibold text-[#0F2744] hover:underline"
-                        >
-                          <KeyRound className="w-3 h-3" />
-                          Generate
-                        </button>
+                      <div className="flex items-center justify-between gap-1 mb-1">
+                        <label className="text-[11px] font-semibold text-slate-700">
+                          {autoGenerateCreds ? 'Login Password (Auto / Editable) *' : 'Manual Login Password *'}
+                        </label>
+                        <div className="inline-flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAutoGenerateCreds(false);
+                              setNewUser((prev) => ({ ...prev, password: '' }));
+                            }}
+                            className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-[#0F2744] hover:underline"
+                          >
+                            <Pencil className="w-2.5 h-2.5" />
+                            Manual
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setNewUser((prev) => ({ ...prev, password: generateClientPassword(8) }))
+                            }
+                            className="inline-flex items-center gap-0.5 text-[10px] font-semibold text-[#EA580C] hover:underline"
+                          >
+                            <KeyRound className="w-3 h-3" />
+                            Auto Pass
+                          </button>
+                        </div>
                       </div>
                       <div className="relative">
                         <input
@@ -914,8 +1372,16 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                           spellCheck={false}
                           value={newUser.password}
                           onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
-                          placeholder="Create password (no spaces)"
-                          className="w-full px-3 py-2 pr-8 text-xs font-mono border border-slate-300 rounded-lg"
+                          placeholder={
+                            autoGenerateCreds
+                              ? 'Auto password (editable)'
+                              : 'Type manual password (no spaces)'
+                          }
+                          className={`w-full px-3 py-2 pr-8 text-xs font-mono border rounded-lg ${
+                            autoGenerateCreds
+                              ? 'border-emerald-300 bg-emerald-50/30'
+                              : 'border-[#0F2744]/40 bg-white'
+                          }`}
                         />
                         <button
                           type="button"
@@ -948,20 +1414,30 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                           const nextRole = e.target.value as UserRole;
                           const nextParentId = pickDefaultParentId(nextRole, users);
                           const parentObj = users.find((u) => String(u.id) === nextParentId);
-                          setNewUser((prev) => ({
-                            ...prev,
-                            role: nextRole,
-                            reportsToUserId: nextParentId,
-                            branchId: parentObj?.branchId ? String(parentObj.branchId) : prev.branchId,
-                            employeeCode:
-                              !prev.employeeCode ||
-                              Object.values(ROLE_CODE_PREFIX).some((p) =>
-                                new RegExp(`^${p}\\d+$`, 'i').test(prev.employeeCode)
-                              ) ||
-                              /^LG\d+$/i.test(prev.employeeCode)
-                                ? suggestNextEmployeeCode(nextRole, users)
-                                : prev.employeeCode,
-                          }));
+                          setNewUser((prev) => {
+                            const shouldAutoUpdateCode =
+                              autoGenerateCreds &&
+                              (!prev.employeeCode ||
+                                Object.values(ROLE_CODE_PREFIX).some((p) =>
+                                  new RegExp(`^${p}\\d+$`, 'i').test(prev.employeeCode)
+                                ) ||
+                                /^LG\d+$/i.test(prev.employeeCode));
+                            const nextCode = shouldAutoUpdateCode
+                              ? suggestNextEmployeeCode(nextRole, users)
+                              : prev.employeeCode;
+                            return {
+                              ...prev,
+                              role: nextRole,
+                              reportsToUserId: nextParentId,
+                              branchId: parentObj?.branchId ? String(parentObj.branchId) : prev.branchId,
+                              employeeCode: nextCode,
+                              password: autoGenerateCreds ? prev.password || generateClientPassword(8) : prev.password,
+                              referralCode:
+                                autoGenerateCreds && nextRole === 'REFERRAL_PARTNER' && nextCode
+                                  ? `DSA-${nextCode}`
+                                  : prev.referralCode,
+                            };
+                          });
                         }}
                         className="w-full px-3 py-2 text-xs border border-slate-300 rounded-lg bg-white"
                       >
@@ -1108,14 +1584,20 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                           onChange={(e) => setKeepCreatingMore(e.target.checked)}
                           className="rounded border-slate-300 accent-[#0F2744]"
                         />
-                        Keep open &amp; auto-ready next ID
+                        {autoGenerateCreds
+                          ? 'Keep open & auto-generate next ID & Password'
+                          : 'Keep open for next manual ID & Password'}
                       </label>
                       <button
                         type="submit"
                         disabled={creatingUsers}
                         className="px-5 py-2 rounded-lg bg-[#EA580C] hover:bg-[#C2410C] disabled:opacity-50 text-white text-xs font-semibold whitespace-nowrap"
                       >
-                        {creatingUsers ? 'Creating...' : 'Create Employee ID & Password'}
+                        {creatingUsers
+                          ? 'Creating...'
+                          : autoGenerateCreds
+                            ? 'Create Auto Employee ID & Password'
+                            : 'Create Manual Employee ID & Password'}
                       </button>
                     </div>
                   </div>
@@ -1449,6 +1931,45 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
                           {u.referralCode && (
                             <div className="text-[10px] font-mono font-semibold text-[#EA580C] mt-0.5">
                               Ref: {u.referralCode}
+                            </div>
+                          )}
+                          {isSuperAdmin && u.savedPassword && (
+                            <div className="mt-1 flex items-center gap-1 text-[10px] font-mono text-slate-600">
+                              <span className="text-slate-400">Pass:</span>
+                              <span className="text-[#EA580C] font-semibold">
+                                {revealedPasswordIds[u.id] ? u.savedPassword : '••••••••'}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setRevealedPasswordIds((prev) => ({ ...prev, [u.id]: !prev[u.id] }))
+                                }
+                                title={revealedPasswordIds[u.id] ? 'Hide password' : 'Show saved password'}
+                                className="p-0.5 text-slate-400 hover:text-[#0F2744]"
+                              >
+                                {revealedPasswordIds[u.id] ? (
+                                  <EyeOff className="w-3 h-3" />
+                                ) : (
+                                  <Eye className="w-3 h-3" />
+                                )}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  handleCopyText(
+                                    `Employee ID: ${u.employeeCode}\nPassword: ${u.savedPassword}`,
+                                    `ROW-${u.id}`
+                                  )
+                                }
+                                title="Copy ID & Password"
+                                className="p-0.5 text-slate-400 hover:text-[#15803D]"
+                              >
+                                {copiedCode === `ROW-${u.id}` ? (
+                                  <Check className="w-3 h-3 text-[#15803D]" />
+                                ) : (
+                                  <Copy className="w-3 h-3" />
+                                )}
+                              </button>
                             </div>
                           )}
                         </td>
@@ -2464,3 +2985,10 @@ export const AdminSettingsModule: React.FC<AdminSettingsProps> = ({
     </div>
   );
 };
+
+export const AdminSettingsModule: React.FC<AdminSettingsProps> = (props) => (
+  <CloudErrorBoundary>
+    <AdminSettingsInner {...props} />
+  </CloudErrorBoundary>
+);
+

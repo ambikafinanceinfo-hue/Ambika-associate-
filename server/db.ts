@@ -17,8 +17,134 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 }
 
 export const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+// Flush any previously uncheckpointed WAL pages into the main DB file before switching to durable direct-write mode
+try {
+  db.pragma('wal_checkpoint(TRUNCATE)');
+} catch {
+  // ignore if not currently in WAL mode
+}
+db.pragma('journal_mode = DELETE');
+db.pragma('synchronous = FULL');
+db.pragma('busy_timeout = 5000');
 db.pragma('foreign_keys = ON');
+
+const USERS_BACKUP_PATH = path.join(process.cwd(), 'data', 'users-backup.json');
+
+export function syncUsersBackupToDisk() {
+  try {
+    const dir = path.dirname(USERS_BACKUP_PATH);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const rows = db
+      .prepare(`
+        SELECT employee_code, full_name, mobile, email, password_hash, admin_saved_password_enc,
+               role, branch_id, team_id, referral_code, is_active, otp_enabled,
+               gps_consent, camera_consent, preferred_lang, service_city, service_pincodes,
+               reports_to_user_id, created_at
+        FROM users
+        ORDER BY id ASC
+      `)
+      .all() as any[];
+    const idToCode = new Map<number, string>();
+    const allIdCodes = db.prepare(`SELECT id, employee_code FROM users`).all() as { id: number; employee_code: string }[];
+    for (const r of allIdCodes) {
+      idToCode.set(Number(r.id), String(r.employee_code));
+    }
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      dbPath: DB_PATH,
+      users: rows.map((r) => ({
+        ...r,
+        reports_to_employee_code: r.reports_to_user_id ? idToCode.get(Number(r.reports_to_user_id)) ?? null : null,
+      })),
+    };
+    const tmpPath = `${USERS_BACKUP_PATH}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), 'utf-8');
+    fs.renameSync(tmpPath, USERS_BACKUP_PATH);
+  } catch (err) {
+    console.error('Failed to sync users backup:', err);
+  }
+}
+
+function restoreUsersFromBackupIfNeeded() {
+  try {
+    if (!fs.existsSync(USERS_BACKUP_PATH)) return;
+    const raw = fs.readFileSync(USERS_BACKUP_PATH, 'utf-8');
+    const parsed = JSON.parse(raw) as { users?: any[] };
+    if (!Array.isArray(parsed.users) || parsed.users.length === 0) return;
+
+    const existingCodes = new Set(
+      (db.prepare(`SELECT UPPER(REPLACE(employee_code, ' ', '')) as c FROM users`).all() as { c: string }[]).map((r) => r.c)
+    );
+    const defaultBranch = db.prepare(`SELECT id FROM branches ORDER BY id ASC LIMIT 1`).get() as { id: number } | undefined;
+    const validBranchIds = new Set(
+      (db.prepare(`SELECT id FROM branches`).all() as { id: number }[]).map((r) => Number(r.id))
+    );
+    const validTeamIds = new Set(
+      (db.prepare(`SELECT id FROM teams`).all() as { id: number }[]).map((r) => Number(r.id))
+    );
+
+    const insertStmt = db.prepare(`
+      INSERT OR IGNORE INTO users (
+        employee_code, full_name, mobile, email, password_hash, admin_saved_password_enc,
+        role, branch_id, team_id, referral_code, is_active, otp_enabled,
+        gps_consent, camera_consent, preferred_lang, service_city, service_pincodes,
+        reports_to_user_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+    `);
+
+    const restoredParents: { employeeCode: string; parentCode: string }[] = [];
+    for (const u of parsed.users) {
+      const cleanCode = String(u.employee_code || '').trim().replace(/\s+/g, '').toUpperCase();
+      if (!cleanCode || existingCodes.has(cleanCode)) continue;
+      const bId = u.branch_id && validBranchIds.has(Number(u.branch_id)) ? Number(u.branch_id) : (defaultBranch?.id ?? null);
+      const tId = u.team_id && validTeamIds.has(Number(u.team_id)) ? Number(u.team_id) : null;
+      try {
+        insertStmt.run(
+          cleanCode,
+          String(u.full_name || cleanCode),
+          String(u.mobile || ''),
+          String(u.email || `${cleanCode.toLowerCase()}@ambikaassociate.in`),
+          String(u.password_hash || ''),
+          u.admin_saved_password_enc ?? null,
+          String(u.role || 'FIELD_OFFICER'),
+          bId,
+          tId,
+          u.referral_code ?? null,
+          u.is_active !== undefined ? Number(u.is_active) : 1,
+          u.otp_enabled !== undefined ? Number(u.otp_enabled) : 0,
+          u.gps_consent !== undefined ? Number(u.gps_consent) : 1,
+          u.camera_consent !== undefined ? Number(u.camera_consent) : 1,
+          u.preferred_lang === 'hi' ? 'hi' : 'en',
+          u.service_city ?? null,
+          u.service_pincodes ?? null,
+          u.created_at || new Date().toISOString().replace('T', ' ').slice(0, 19)
+        );
+        existingCodes.add(cleanCode);
+        if (u.reports_to_employee_code) {
+          restoredParents.push({ employeeCode: cleanCode, parentCode: String(u.reports_to_employee_code) });
+        }
+      } catch {
+        // skip conflicting duplicate referral code
+      }
+    }
+
+    for (const link of restoredParents) {
+      const parent = db
+        .prepare(`SELECT id FROM users WHERE UPPER(employee_code) = UPPER(?)`)
+        .get(link.parentCode) as { id: number } | undefined;
+      if (parent) {
+        db.prepare(`UPDATE users SET reports_to_user_id = ? WHERE UPPER(employee_code) = UPPER(?) AND reports_to_user_id IS NULL`).run(
+          parent.id,
+          link.employeeCode
+        );
+      }
+    }
+  } catch (err) {
+    console.error('Failed to restore users backup:', err);
+  }
+}
 
 export const UPLOADS_PATH = UPLOAD_DIR;
 
@@ -486,6 +612,9 @@ export function initDatabase() {
   if (!userCols.includes('profile_photo_data_url')) {
     db.exec(`ALTER TABLE users ADD COLUMN profile_photo_data_url TEXT`);
   }
+  if (!userCols.includes('admin_saved_password_enc')) {
+    db.exec(`ALTER TABLE users ADD COLUMN admin_saved_password_enc TEXT`);
+  }
 
   // Safe migration for existing SQLite files where users.role CHECK lacked LEAD_GENERATOR or mobile had UNIQUE
   const usersSqlRow = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'`).get() as { sql?: string } | undefined;
@@ -688,7 +817,9 @@ export function initDatabase() {
   `).run();
   seedOfficerTerritoriesIfNeeded();
   seedSalesExtensionsIfNeeded();
+  restoreUsersFromBackupIfNeeded();
   seedHierarchyLinksIfNeeded();
+  syncUsersBackupToDisk();
 }
 
 function seedHierarchyLinksIfNeeded() {

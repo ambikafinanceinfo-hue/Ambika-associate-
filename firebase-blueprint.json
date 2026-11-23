@@ -1,0 +1,281 @@
+{
+  "entities": {
+    "AdminAccount": {
+      "title": "AdminAccount",
+      "description": "Authorized Super Admin cloud operator verified via Google Sign-In.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 160
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "enum": ["SUPER_ADMIN"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "displayName", "role", "createdAt", "updatedAt"]
+    },
+    "CrmEmployeeRecord": {
+      "title": "CrmEmployeeRecord",
+      "description": "Persistent cloud record for an AMBIKA ASSOCIATE CRM employee or referral partner login ID and encrypted credentials.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "employeeCode": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 32,
+          "pattern": "^[A-Za-z0-9_\\-]+$"
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "mobile": {
+          "type": "string",
+          "maxLength": 24
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 160
+        },
+        "passwordHash": {
+          "type": "string",
+          "minLength": 10,
+          "maxLength": 200
+        },
+        "adminSavedPasswordEnc": {
+          "type": "string",
+          "maxLength": 512
+        },
+        "role": {
+          "type": "string",
+          "enum": [
+            "SUPER_ADMIN",
+            "BRANCH_MANAGER",
+            "TEAM_LEADER",
+            "LEAD_GENERATOR",
+            "FIELD_OFFICER",
+            "REFERRAL_PARTNER"
+          ]
+        },
+        "branchCode": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "teamName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "reportsToEmployeeCode": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "referralCode": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "serviceCity": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "servicePincodes": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "otpEnabled": {
+          "type": "boolean"
+        },
+        "preferredLang": {
+          "type": "string",
+          "enum": ["en", "hi"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "employeeCode",
+        "fullName",
+        "mobile",
+        "email",
+        "passwordHash",
+        "adminSavedPasswordEnc",
+        "role",
+        "branchCode",
+        "teamName",
+        "reportsToEmployeeCode",
+        "referralCode",
+        "serviceCity",
+        "servicePincodes",
+        "isActive",
+        "otpEnabled",
+        "preferredLang",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CrmBranchRecord": {
+      "title": "CrmBranchRecord",
+      "description": "Persistent cloud record of an AMBIKA ASSOCIATE branch office.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "code": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 40,
+          "pattern": "^[A-Za-z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "city": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "state": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "isActive": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerUid", "code", "name", "city", "state", "isActive", "createdAt", "updatedAt"]
+    },
+    "CrmSettingRecord": {
+      "title": "CrmSettingRecord",
+      "description": "Persistent cloud record of AMBIKA ASSOCIATE CRM global rules and office settings.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "settingKey": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9_\\-]+$"
+        },
+        "officeName": {
+          "type": "string",
+          "maxLength": 140
+        },
+        "officeAddress": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "petrolRatePerKm": {
+          "type": "number"
+        },
+        "attendanceCutoffTime": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "attendanceLatePenaltyInr": {
+          "type": "number"
+        },
+        "unapprovedLeavePenaltyInr": {
+          "type": "number"
+        },
+        "defaultLanguage": {
+          "type": "string",
+          "enum": ["en", "hi"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerUid",
+        "settingKey",
+        "officeName",
+        "officeAddress",
+        "petrolRatePerKm",
+        "attendanceCutoffTime",
+        "attendanceLatePenaltyInr",
+        "unapprovedLeavePenaltyInr",
+        "defaultLanguage",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminAccount" },
+      "description": "Authorized cloud Super Admin profiles for verifying administrative cloud sync permissions."
+    },
+    "/crm_employees/{employeeCode}": {
+      "schema": { "$ref": "#/entities/CrmEmployeeRecord" },
+      "description": "Persistent cloud storage of all AMBIKA ASSOCIATE employee and referral partner login IDs, password hashes, encrypted admin vault passwords, and hierarchy metadata."
+    },
+    "/crm_branches/{branchCode}": {
+      "schema": { "$ref": "#/entities/CrmBranchRecord" },
+      "description": "Persistent cloud storage of AMBIKA ASSOCIATE branch offices."
+    },
+    "/crm_settings/{settingKey}": {
+      "schema": { "$ref": "#/entities/CrmSettingRecord" },
+      "description": "Persistent cloud storage of AMBIKA ASSOCIATE CRM global rules and office configuration."
+    }
+  }
+}
