@@ -14,7 +14,6 @@ import {
   FileBarChart2,
   HelpCircle,
   Home,
-  Languages,
   LayoutDashboard,
   LogOut,
   Menu,
@@ -1010,14 +1009,6 @@ export default function App() {
         {/* Top Header Bar */}
         <header className="sticky top-0 z-30 bg-white border-b border-slate-200 px-3 sm:px-6 py-2.5 flex items-center justify-between gap-2 sm:gap-4">
           <div className="flex items-center gap-2 sm:gap-3 min-w-0">
-            <button
-              type="button"
-              onClick={() => setMobileMenuOpen(true)}
-              className="lg:hidden p-2 rounded-lg border border-slate-200 text-[#0F2744] shrink-0"
-              aria-label="Open menu"
-            >
-              <Menu className="w-5 h-5" />
-            </button>
             {/* Header Back & Forward Buttons */}
             <div className="inline-flex items-center rounded-lg border border-slate-200 bg-slate-50 p-0.5 shrink-0">
               <button
@@ -1074,16 +1065,6 @@ export default function App() {
               </button>
             )}
 
-            <button
-              type="button"
-              onClick={handleToggleLang}
-              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg border border-slate-200 hover:bg-slate-50 text-xs font-semibold text-[#0F2744] whitespace-nowrap shrink-0"
-              title="Switch Language (English / हिंदी)"
-            >
-              <Languages className="w-3.5 h-3.5" />
-              {lang === 'en' ? 'हिंदी' : 'EN'}
-            </button>
-
             {!isReferral && (
               <button
                 type="button"
@@ -1112,18 +1093,6 @@ export default function App() {
                 </span>
               </button>
             )}
-
-            {/* TOP HEADER CAMERA ICON BESIDE BELL ICON: Launches full camera studio immediately */}
-            <button
-              type="button"
-              onClick={() => setShowQuickCamera(true)}
-              aria-label="Open Field Camera & Document Scanner"
-              title="Open Camera (Visit Selfie with Geo+Time or Clean Document Scan)"
-              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#0F2744] hover:bg-[#16365D] text-white text-xs font-semibold transition-colors whitespace-nowrap shrink-0"
-            >
-              <Camera className="w-4 h-4 text-[#EA580C]" />
-              <span className="hidden sm:inline">{lang === 'hi' ? 'कैमरा' : 'Camera'}</span>
-            </button>
 
             <button
               type="button"

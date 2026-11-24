@@ -30,9 +30,10 @@ service cloud.firestore {
 
     function isBootstrappedAdmin() {
       return isVerifiedUser() &&
+        request.auth.token.email is string &&
         (
-          request.auth.token.email == 'rajadineshgupta0@gmail.com' ||
-          request.auth.token.email == 'ambikafinance.info@gmail.com'
+          request.auth.token.email.lower() == 'rajadineshgupta0@gmail.com' ||
+          request.auth.token.email.lower() == 'ambikafinance.info@gmail.com'
         );
     }
 
@@ -146,7 +147,7 @@ service cloud.firestore {
     // 4. Authorized Admin Profiles
     match /admins/{adminUid} {
       allow get: if isVerifiedUser() && isValidId(adminUid) && (request.auth.uid == adminUid || isBootstrappedAdmin());
-      allow list: if isBootstrappedAdmin() && resource.data.role == 'SUPER_ADMIN';
+      allow list: if isBootstrappedAdmin();
       allow create: if isBootstrappedAdmin() &&
         isValidId(adminUid) &&
         isValidAdminAccount(incoming(), adminUid) &&
@@ -165,7 +166,7 @@ service cloud.firestore {
     // 5. Persistent CRM Employees & Encrypted Credentials Vault (Admin Only)
     match /crm_employees/{employeeCode} {
       allow get: if isVerifiedUser() && isValidId(employeeCode) && isAdmin();
-      allow list: if isAdmin() && resource.data.employeeCode is string;
+      allow list: if isBootstrappedAdmin();
       allow create: if isVerifiedUser() &&
         isValidId(employeeCode) &&
         isValidEmployeeRecord(incoming(), employeeCode) &&
@@ -193,7 +194,7 @@ service cloud.firestore {
     // 6. Persistent CRM Branches (Admin Only)
     match /crm_branches/{branchCode} {
       allow get: if isVerifiedUser() && isValidId(branchCode) && isAdmin();
-      allow list: if isAdmin() && resource.data.code is string;
+      allow list: if isBootstrappedAdmin();
       allow create: if isVerifiedUser() &&
         isValidId(branchCode) &&
         isValidBranchRecord(incoming(), branchCode) &&
@@ -216,7 +217,7 @@ service cloud.firestore {
     // 7. Persistent CRM Settings (Admin Only)
     match /crm_settings/{settingKey} {
       allow get: if isVerifiedUser() && isValidId(settingKey) && isAdmin();
-      allow list: if isAdmin() && resource.data.settingKey is string;
+      allow list: if isBootstrappedAdmin();
       allow create: if isVerifiedUser() &&
         isValidId(settingKey) &&
         isValidSettingRecord(incoming(), settingKey) &&
