@@ -22,6 +22,10 @@ import {
   RefreshCw,
   LogOut,
   CheckCircle2,
+  ArrowRightLeft,
+  UserCog,
+  X,
+  AlertTriangle,
 } from 'lucide-react';
 import type { User as FirebaseUser } from 'firebase/auth';
 import {
@@ -179,6 +183,29 @@ const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
 
   const [editingTerritoryId, setEditingTerritoryId] = useState<number | null>(null);
   const [territoryDraft, setTerritoryDraft] = useState({ serviceCity: '', servicePincodes: '' });
+
+  // Designation / Role Change + Reporting Senior Modal
+  const [roleModalUser, setRoleModalUser] = useState<any | null>(null);
+  const [roleModalDraft, setRoleModalDraft] = useState({
+    role: 'FIELD_OFFICER' as UserRole,
+    reportsToUserId: '',
+    branchId: '',
+    transferExistingDownlineToUserId: '',
+  });
+  const [savingRoleChange, setSavingRoleChange] = useState(false);
+
+  // Bulk Downline Transfer Modal (BM->BM, TL->TL, FO->FO)
+  const [transferModalOpen, setTransferModalOpen] = useState(false);
+  const [transferLevel, setTransferLevel] = useState<'TEAM_LEADER' | 'FIELD_OFFICER' | 'REFERRAL_PARTNER'>('FIELD_OFFICER');
+  const [transferSourceSeniorId, setTransferSourceSeniorId] = useState<string>('ALL');
+  const [transferTargetSeniorId, setTransferTargetSeniorId] = useState<string>('');
+  const [transferSelectedIds, setTransferSelectedIds] = useState<number[]>([]);
+  const [savingTransfer, setSavingTransfer] = useState(false);
+
+  // Permanent Delete Employee ID Modal
+  const [deleteModalUser, setDeleteModalUser] = useState<any | null>(null);
+  const [deleteTransferToId, setDeleteTransferToId] = useState<string>('');
+  const [deletingUser, setDeletingUser] = useState(false);
 
   // Rules state
   const [rules, setRules] = useState<SystemSettings>(settings);
@@ -774,6 +801,163 @@ const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
       void mirrorChangesToCloud();
     } catch (err: any) {
       setErrorMsg(err.message || 'Could not update OTP requirement');
+    }
+  };
+
+  const openRoleAndTransferModal = (target: any) => {
+    setErrorMsg(null);
+    setRoleModalUser(target);
+    setRoleModalDraft({
+      role: target.role as UserRole,
+      reportsToUserId: target.reportsToUserId ? String(target.reportsToUserId) : '',
+      branchId: target.branchId ? String(target.branchId) : branches[0]?.id ? String(branches[0].id) : '',
+      transferExistingDownlineToUserId: '',
+    });
+  };
+
+  const handleSaveRoleAndSenior = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isSuperAdmin || !roleModalUser) return;
+    setMsg(null);
+    setErrorMsg(null);
+    setSavingRoleChange(true);
+    try {
+      const needsParent = ['TEAM_LEADER', 'FIELD_OFFICER', 'REFERRAL_PARTNER'].includes(roleModalDraft.role);
+      const res = await apiFetch<{
+        ok: boolean;
+        role?: UserRole;
+        transferredChildCount?: number;
+      }>(`/admin/users/${roleModalUser.id}`, {
+        method: 'PATCH',
+        json: {
+          role: roleModalDraft.role,
+          reportsToUserId: needsParent ? (roleModalDraft.reportsToUserId ? Number(roleModalDraft.reportsToUserId) : null) : null,
+          branchId: roleModalDraft.branchId ? Number(roleModalDraft.branchId) : null,
+          transferExistingDownlineToUserId: roleModalDraft.transferExistingDownlineToUserId
+            ? Number(roleModalDraft.transferExistingDownlineToUserId)
+            : null,
+        },
+      });
+      const roleTitle =
+        roleModalDraft.role === 'LEAD_GENERATOR' ? 'Back Office Team' : roleModalDraft.role.replace(/_/g, ' ');
+      setMsg(
+        `Updated ${roleModalUser.fullName} (${roleModalUser.employeeCode}) → ${roleTitle}${
+          res.transferredChildCount ? ` and transferred ${res.transferredChildCount} downline member(s)` : ''
+        }${cloudUser ? ' · synced to Google Cloud' : ''}.`
+      );
+      setRoleModalUser(null);
+      await loadAll();
+      void mirrorChangesToCloud();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Could not update designation or reporting senior');
+    } finally {
+      setSavingRoleChange(false);
+    }
+  };
+
+  const openBulkTransferModal = (presetSenior?: any) => {
+    setErrorMsg(null);
+    if (presetSenior) {
+      const level =
+        presetSenior.role === 'BRANCH_MANAGER'
+          ? 'TEAM_LEADER'
+          : presetSenior.role === 'TEAM_LEADER'
+          ? 'FIELD_OFFICER'
+          : 'REFERRAL_PARTNER';
+      setTransferLevel(level);
+      setTransferSourceSeniorId(String(presetSenior.id));
+      const directKids = users
+        .filter((u) => u.role === level && Number(u.reportsToUserId || 0) === Number(presetSenior.id))
+        .map((u) => Number(u.id));
+      setTransferSelectedIds(directKids);
+      setTransferTargetSeniorId('');
+    } else {
+      setTransferLevel('FIELD_OFFICER');
+      setTransferSourceSeniorId('ALL');
+      setTransferSelectedIds([]);
+      setTransferTargetSeniorId('');
+    }
+    setTransferModalOpen(true);
+  };
+
+  const handleConfirmBulkTransfer = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isSuperAdmin) return;
+    if (transferSelectedIds.length === 0) {
+      setErrorMsg('Please select at least one downline employee to transfer.');
+      return;
+    }
+    if (!transferTargetSeniorId) {
+      setErrorMsg('Please choose a destination senior.');
+      return;
+    }
+    setMsg(null);
+    setErrorMsg(null);
+    setSavingTransfer(true);
+    try {
+      const res = await apiFetch<{
+        ok: boolean;
+        transferredCount: number;
+        targetSenior?: { employeeCode: string; fullName: string };
+      }>('/admin/users/transfer-downline', {
+        method: 'POST',
+        json: {
+          employeeIds: transferSelectedIds,
+          targetSeniorId: Number(transferTargetSeniorId),
+        },
+      });
+      setMsg(
+        `Transferred ${res.transferredCount} downline employee(s) under ${res.targetSenior?.fullName || 'new senior'} (${
+          res.targetSenior?.employeeCode || ''
+        })${cloudUser ? ' & synced to Google Cloud' : ''}.`
+      );
+      setTransferModalOpen(false);
+      setTransferSelectedIds([]);
+      await loadAll();
+      void mirrorChangesToCloud();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Could not transfer downline employees');
+    } finally {
+      setSavingTransfer(false);
+    }
+  };
+
+  const handleConfirmDeleteUser = async () => {
+    if (!isSuperAdmin || !deleteModalUser) return;
+    setMsg(null);
+    setErrorMsg(null);
+    setDeletingUser(true);
+    try {
+      const deletedCode = String(deleteModalUser.employeeCode || '').trim().toUpperCase();
+      const res = await apiFetch<{
+        ok: boolean;
+        deletedEmployeeCode: string;
+        deletedFullName: string;
+        transferredDownlineCount: number;
+      }>(`/admin/users/${deleteModalUser.id}`, {
+        method: 'DELETE',
+        json: {
+          transferDownlineToUserId: deleteTransferToId ? Number(deleteTransferToId) : null,
+        },
+      });
+      setGeneratedCredentials((prev) =>
+        prev.filter((c) => String(c.employeeCode || '').trim().toUpperCase() !== deletedCode)
+      );
+      setMsg(
+        `Permanently deleted Employee ID ${res.deletedEmployeeCode} (${res.deletedFullName})${
+          res.transferredDownlineCount > 0
+            ? ` and transferred ${res.transferredDownlineCount} downline member(s)`
+            : ''
+        }${cloudUser ? ' · removed from Google Cloud' : ''}.`
+      );
+      setDeleteModalUser(null);
+      setDeleteTransferToId('');
+      await loadAll();
+      void mirrorChangesToCloud(deletedCode);
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Could not delete Employee ID');
+    } finally {
+      setDeletingUser(false);
     }
   };
 
@@ -1877,23 +2061,35 @@ const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
                   className="w-full pl-8 pr-3 py-1.5 text-xs border border-slate-300 rounded-lg bg-white"
                 />
               </div>
-              <div className="flex items-center gap-1 p-0.5 bg-slate-200/70 rounded-lg">
-                {[
-                  { id: 'ALL', label: `All (${users.length})` },
-                  { id: 'ON', label: `ON (${activeLoginCount})` },
-                  { id: 'OFF', label: `OFF (${offLoginCount})` },
-                ].map((f) => (
+              <div className="flex flex-wrap items-center gap-2">
+                {isSuperAdmin && (
                   <button
-                    key={f.id}
                     type="button"
-                    onClick={() => setStatusFilter(f.id as any)}
-                    className={`px-2.5 py-1 text-[11px] font-semibold rounded-md ${
-                      statusFilter === f.id ? 'bg-white text-[#0F2744] shadow-xs' : 'text-slate-600'
-                    }`}
+                    onClick={() => openBulkTransferModal()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#0F2744] hover:bg-[#16365D] text-white text-[11px] font-semibold whitespace-nowrap shrink-0"
                   >
-                    {f.label}
+                    <ArrowRightLeft className="w-3.5 h-3.5 text-[#EA580C]" />
+                    Transfer Downline Team
                   </button>
-                ))}
+                )}
+                <div className="flex items-center gap-1 p-0.5 bg-slate-200/70 rounded-lg">
+                  {[
+                    { id: 'ALL', label: `All (${users.length})` },
+                    { id: 'ON', label: `ON (${activeLoginCount})` },
+                    { id: 'OFF', label: `OFF (${offLoginCount})` },
+                  ].map((f) => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      onClick={() => setStatusFilter(f.id as any)}
+                      className={`px-2.5 py-1 text-[11px] font-semibold rounded-md ${
+                        statusFilter === f.id ? 'bg-white text-[#0F2744] shadow-xs' : 'text-slate-600'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
 
@@ -1908,7 +2104,7 @@ const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
                     <th className="text-left px-4 py-3 font-semibold">Branch &amp; Territory</th>
                     <th className="text-left px-4 py-3 font-semibold">OTP Login</th>
                     <th className="text-left px-4 py-3 font-semibold">Login Status</th>
-                    {isSuperAdmin && <th className="text-right px-4 py-3 font-semibold">Admin Controls (ON/OFF &amp; Password)</th>}
+                    {isSuperAdmin && <th className="text-right px-4 py-3 font-semibold">Admin Controls (Role · Transfer · Delete · ON/OFF)</th>}
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
@@ -2066,7 +2262,7 @@ const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
                         </td>
                         {isSuperAdmin && (
                           <td className="px-4 py-3 text-right space-y-1.5 whitespace-nowrap">
-                            <div className="flex items-center justify-end gap-1.5">
+                            <div className="flex flex-wrap items-center justify-end gap-1.5">
                               {['FIELD_OFFICER', 'TEAM_LEADER'].includes(u.role) && (
                                 <button
                                   type="button"
@@ -2077,9 +2273,34 @@ const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
                                       servicePincodes: u.servicePincodes || '',
                                     });
                                   }}
-                                  className="px-2.5 py-1 rounded border border-slate-300 text-[11px] font-semibold text-[#0F2744] hover:bg-slate-50"
+                                  className="px-2 py-1 rounded border border-slate-300 text-[11px] font-semibold text-[#0F2744] hover:bg-slate-50"
                                 >
                                   Territory
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                disabled={isSelf}
+                                title={
+                                  isSelf
+                                    ? 'You cannot change your own Super Admin designation'
+                                    : 'Change Designation / Role or Transfer to Another Senior'
+                                }
+                                onClick={() => openRoleAndTransferModal(u)}
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded border border-blue-300 bg-blue-50/70 text-[11px] font-semibold text-[#0F2744] hover:bg-[#0F2744] hover:text-white transition-colors disabled:opacity-45"
+                              >
+                                <UserCog className="w-3 h-3" />
+                                Role / Transfer
+                              </button>
+                              {Number(u.childCount || 0) > 0 && (
+                                <button
+                                  type="button"
+                                  title={`Transfer ${u.fullName}'s ${u.childCount} downline staff to another senior`}
+                                  onClick={() => openBulkTransferModal(u)}
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-300 bg-slate-50 text-[11px] font-semibold text-[#0F2744] hover:bg-slate-200 transition-colors"
+                                >
+                                  <ArrowRightLeft className="w-3 h-3 text-[#EA580C]" />
+                                  Shift Team ({u.childCount})
                                 </button>
                               )}
                               <button
@@ -2092,7 +2313,7 @@ const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
                                     referralCode: u.referralCode || '',
                                   });
                                 }}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-orange-300 bg-orange-50/70 text-[11px] font-semibold text-[#C2410C] hover:bg-[#EA580C] hover:text-white transition-colors"
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded border border-orange-300 bg-orange-50/70 text-[11px] font-semibold text-[#C2410C] hover:bg-[#EA580C] hover:text-white transition-colors"
                               >
                                 <Pencil className="w-3 h-3" />
                                 Rename ID
@@ -2104,7 +2325,7 @@ const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
                                   setResetPasswordUserId(u.id);
                                   setResetPasswordDraft(generateClientPassword(8));
                                 }}
-                                className="inline-flex items-center gap-1 px-2.5 py-1 rounded border border-slate-300 text-[11px] font-semibold text-[#0F2744] hover:bg-slate-50"
+                                className="inline-flex items-center gap-1 px-2 py-1 rounded border border-slate-300 text-[11px] font-semibold text-[#0F2744] hover:bg-slate-50"
                               >
                                 <KeyRound className="w-3 h-3" />
                                 Password
@@ -2114,15 +2335,30 @@ const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
                                 disabled={isSelf || togglingUserId === u.id}
                                 title={isSelf ? 'You cannot turn OFF your own active Super Admin Login ID' : u.isActive ? 'Turn OFF this Login ID' : 'Turn ON this Login ID'}
                                 onClick={() => toggleUserActive(u)}
-                                className={`inline-flex items-center gap-1 px-3 py-1 rounded text-[11px] font-semibold border transition-colors disabled:opacity-45 ${
+                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded text-[11px] font-semibold border transition-colors disabled:opacity-45 ${
                                   u.isActive
-                                    ? 'border-[#DC2626] text-[#DC2626] bg-red-50 hover:bg-[#DC2626] hover:text-white'
+                                    ? 'border-[#D97706] text-[#B45309] bg-amber-50 hover:bg-[#D97706] hover:text-white'
                                     : 'border-[#15803D] text-[#15803D] bg-green-50 hover:bg-[#15803D] hover:text-white'
                                 }`}
                               >
                                 <Power className="w-3 h-3" />
-                                {isSelf ? 'Current Admin' : u.isActive ? 'Turn OFF ID' : 'Turn ON ID'}
+                                {isSelf ? 'Current Admin' : u.isActive ? 'Turn OFF' : 'Turn ON'}
                               </button>
+                              {!isSelf && (
+                                <button
+                                  type="button"
+                                  title={`Permanently delete Employee ID ${u.employeeCode}`}
+                                  onClick={() => {
+                                    setErrorMsg(null);
+                                    setDeleteModalUser(u);
+                                    setDeleteTransferToId('');
+                                  }}
+                                  className="inline-flex items-center gap-1 px-2 py-1 rounded border border-[#DC2626] text-[#DC2626] bg-red-50 hover:bg-[#DC2626] hover:text-white text-[11px] font-semibold transition-colors"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                  Delete
+                                </button>
+                              )}
                             </div>
                             {renamingUserId === u.id && (
                               <div className="flex flex-wrap items-center justify-end gap-1.5 pt-1">
@@ -2982,6 +3218,525 @@ const AdminSettingsInner: React.FC<AdminSettingsProps> = ({
           </div>
         </div>
       )}
+
+      {/* =================================================================== */}
+      {/* MODAL 1: CHANGE DESIGNATION / ROLE & REPORTING SENIOR               */}
+      {/* =================================================================== */}
+      {isSuperAdmin && roleModalUser && (() => {
+        const nextParentMeta = getParentQuotaLabel(roleModalDraft.role);
+        const nextParentCandidates = getParentCandidatesForRole(roleModalDraft.role, users).filter(
+          (p) => p.id !== roleModalUser.id
+        );
+        const roleChanged = roleModalDraft.role !== roleModalUser.role;
+        const directDownline = users.filter(
+          (c) => Number(c.reportsToUserId || 0) === Number(roleModalUser.id)
+        );
+        const replacementSeniors =
+          roleChanged && directDownline.length > 0
+            ? users.filter(
+                (s) => s.isActive && s.role === roleModalUser.role && s.id !== roleModalUser.id
+              )
+            : [];
+
+        return (
+          <div
+            className="fixed inset-0 z-50 bg-slate-900/55 flex items-center justify-center p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="role-transfer-modal-title"
+          >
+            <div className="bg-white border border-slate-200 rounded-xl w-full max-w-lg shadow-xl overflow-hidden">
+              <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-2">
+                <div>
+                  <h3 id="role-transfer-modal-title" className="text-sm font-display font-bold text-[#0F2744]">
+                    Change Designation &amp; Reporting Senior
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    {roleModalUser.fullName} · <span className="font-mono">{roleModalUser.employeeCode}</span>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setRoleModalUser(null)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                  aria-label="Close modal"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <form onSubmit={handleSaveRoleAndSenior} className="p-5 space-y-4">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Designation / Role
+                  </label>
+                  <select
+                    value={roleModalDraft.role}
+                    onChange={(e) => {
+                      const nextRole = e.target.value as UserRole;
+                      const candidates = getParentCandidatesForRole(nextRole, users).filter(
+                        (p) => p.id !== roleModalUser.id
+                      );
+                      setRoleModalDraft((prev) => ({
+                        ...prev,
+                        role: nextRole,
+                        reportsToUserId: candidates[0] ? String(candidates[0].id) : '',
+                        transferExistingDownlineToUserId: '',
+                      }));
+                    }}
+                    className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 bg-white text-slate-900"
+                  >
+                    {USER_ROLES.map((r) => (
+                      <option key={r.value} value={r.value}>
+                        {r.labelEn}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {nextParentMeta ? (
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      {nextParentMeta.title}
+                    </label>
+                    <select
+                      required
+                      value={roleModalDraft.reportsToUserId}
+                      onChange={(e) => {
+                        const chosen = nextParentCandidates.find((p) => String(p.id) === e.target.value);
+                        setRoleModalDraft((prev) => ({
+                          ...prev,
+                          reportsToUserId: e.target.value,
+                          branchId: chosen?.branchId ? String(chosen.branchId) : prev.branchId,
+                        }));
+                      }}
+                      className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 bg-white text-slate-900"
+                    >
+                      <option value="">-- Select Reporting Senior --</option>
+                      {nextParentCandidates.map((p) => {
+                        const used = Number(p.childCount || 0);
+                        const isCurrentParent = Number(p.id) === Number(roleModalUser.reportsToUserId || 0);
+                        const isFull = !isCurrentParent && used >= nextParentMeta.max;
+                        return (
+                          <option key={p.id} value={String(p.id)} disabled={isFull}>
+                            {p.fullName} ({p.employeeCode}) — {used}/{nextParentMeta.max} {nextParentMeta.unit}
+                            {isCurrentParent ? ' [Current]' : isFull ? ' [FULL]' : ''}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </div>
+                ) : (
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      Branch Office
+                    </label>
+                    <select
+                      value={roleModalDraft.branchId}
+                      onChange={(e) => setRoleModalDraft((prev) => ({ ...prev, branchId: e.target.value }))}
+                      className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 bg-white text-slate-900"
+                    >
+                      {branches.map((b) => (
+                        <option key={b.id} value={String(b.id)}>
+                          {b.name} ({b.code})
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-[11px] text-slate-500 mt-1">
+                      Top-level role — no reporting senior required.
+                    </p>
+                  </div>
+                )}
+
+                {roleChanged && directDownline.length > 0 && (
+                  <div className="p-3.5 rounded-lg bg-amber-50 border border-amber-200 space-y-2">
+                    <div className="text-xs font-semibold text-amber-900">
+                      Existing Downline Detected ({directDownline.length} mapped staff)
+                    </div>
+                    <p className="text-[11px] text-amber-800">
+                      Because {roleModalUser.fullName}&apos;s designation is changing from{' '}
+                      <strong>{String(roleModalUser.role).replace(/_/g, ' ')}</strong>, choose another senior to take over
+                      their {directDownline.length} downline staff (or leave unlinked to reassign later):
+                    </p>
+                    <select
+                      value={roleModalDraft.transferExistingDownlineToUserId}
+                      onChange={(e) =>
+                        setRoleModalDraft((prev) => ({
+                          ...prev,
+                          transferExistingDownlineToUserId: e.target.value,
+                        }))
+                      }
+                      className="w-full px-3 py-2 text-xs rounded-lg border border-amber-300 bg-white text-slate-900"
+                    >
+                      <option value="">Leave downline unlinked (reassign later)</option>
+                      {replacementSeniors.map((s) => (
+                        <option key={s.id} value={String(s.id)}>
+                          Transfer all {directDownline.length} staff → {s.fullName} ({s.employeeCode}) [{s.childCount ?? 0}
+                          {s.quotaMax ? `/${s.quotaMax}` : ''}]
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+                  <button
+                    type="button"
+                    onClick={() => setRoleModalUser(null)}
+                    className="px-4 py-2 text-xs font-semibold rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={savingRoleChange}
+                    className="px-4 py-2 text-xs font-semibold rounded-lg bg-[#0F2744] hover:bg-[#16365D] disabled:opacity-60 text-white"
+                  >
+                    {savingRoleChange ? 'Saving…' : 'Save Designation & Senior'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* =================================================================== */}
+      {/* MODAL 2: BULK / TEAM DOWNLINE TRANSFER TO ANOTHER SENIOR            */}
+      {/* =================================================================== */}
+      {isSuperAdmin && transferModalOpen && (() => {
+        const parentRole: UserRole =
+          transferLevel === 'TEAM_LEADER'
+            ? 'BRANCH_MANAGER'
+            : transferLevel === 'FIELD_OFFICER'
+            ? 'TEAM_LEADER'
+            : 'FIELD_OFFICER';
+        const quotaMax =
+          transferLevel === 'TEAM_LEADER'
+            ? HIERARCHY_LIMITS.TEAM_LEADERS_PER_BM
+            : transferLevel === 'FIELD_OFFICER'
+            ? HIERARCHY_LIMITS.FIELD_OFFICERS_PER_TL
+            : HIERARCHY_LIMITS.REFERRALS_PER_FO;
+        const seniorOptions = users.filter((u) => u.isActive && u.role === parentRole);
+        const allLevelStaff = users.filter((u) => u.role === transferLevel);
+        const visibleStaff = allLevelStaff.filter((emp) => {
+          if (transferSourceSeniorId === 'ALL') return true;
+          if (transferSourceSeniorId === 'UNASSIGNED') return !emp.reportsToUserId;
+          return Number(emp.reportsToUserId || 0) === Number(transferSourceSeniorId);
+        });
+
+        const toggleSelectId = (id: number) => {
+          setTransferSelectedIds((prev) =>
+            prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+          );
+        };
+
+        return (
+          <div
+            className="fixed inset-0 z-50 bg-slate-900/55 flex items-center justify-center p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="bulk-transfer-modal-title"
+          >
+            <div className="bg-white border border-slate-200 rounded-xl w-full max-w-2xl shadow-xl overflow-hidden max-h-[90vh] flex flex-col">
+              <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-2 shrink-0">
+                <div>
+                  <h3 id="bulk-transfer-modal-title" className="text-sm font-display font-bold text-[#0F2744]">
+                    Transfer Downline Employees to Another Senior
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Move one or multiple Team Leaders, Field Officers, or Referrals to a different Senior with live quota checks
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTransferModalOpen(false)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100"
+                  aria-label="Close transfer modal"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <form onSubmit={handleConfirmBulkTransfer} className="p-5 space-y-4 overflow-y-auto">
+                {/* Level Segmented Tabs */}
+                <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg">
+                  {(
+                    [
+                      { id: 'TEAM_LEADER', label: 'Team Leaders (BM → BM)' },
+                      { id: 'FIELD_OFFICER', label: 'Field Officers (TL → TL)' },
+                      { id: 'REFERRAL_PARTNER', label: 'Referrals (FO → FO)' },
+                    ] as const
+                  ).map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => {
+                        setTransferLevel(tab.id);
+                        setTransferSourceSeniorId('ALL');
+                        setTransferTargetSeniorId('');
+                        setTransferSelectedIds([]);
+                      }}
+                      className={`flex-1 px-3 py-1.5 text-xs font-semibold rounded-md transition-colors whitespace-nowrap ${
+                        transferLevel === tab.id ? 'bg-white text-[#0F2744] shadow-xs' : 'text-slate-600'
+                      }`}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      1. Filter Current Senior (Source)
+                    </label>
+                    <select
+                      value={transferSourceSeniorId}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        setTransferSourceSeniorId(val);
+                        setTransferSelectedIds([]);
+                      }}
+                      className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 bg-white text-slate-900"
+                    >
+                      <option value="ALL">All ({allLevelStaff.length})</option>
+                      <option value="UNASSIGNED">
+                        Unassigned / No Senior ({allLevelStaff.filter((x) => !x.reportsToUserId).length})
+                      </option>
+                      {seniorOptions.map((s) => (
+                        <option key={s.id} value={String(s.id)}>
+                          {s.fullName} ({s.employeeCode}) — {s.childCount ?? 0}/{quotaMax}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      2. Transfer To Destination Senior
+                    </label>
+                    <select
+                      required
+                      value={transferTargetSeniorId}
+                      onChange={(e) => setTransferTargetSeniorId(e.target.value)}
+                      className="w-full px-3 py-2 text-xs rounded-lg border border-slate-300 bg-white text-slate-900"
+                    >
+                      <option value="">-- Choose Destination Senior --</option>
+                      {seniorOptions
+                        .filter((s) => String(s.id) !== transferSourceSeniorId)
+                        .map((s) => {
+                          const used = Number(s.childCount || 0);
+                          const rem = Math.max(0, quotaMax - used);
+                          return (
+                            <option key={s.id} value={String(s.id)} disabled={rem === 0}>
+                              {s.fullName} ({s.employeeCode}) — {used}/{quotaMax} ({rem} slots free)
+                            </option>
+                          );
+                        })}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Selectable Employee List */}
+                <div className="border border-slate-200 rounded-lg overflow-hidden">
+                  <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2 text-xs">
+                    <span className="font-semibold text-[#0F2744]">
+                      3. Select Downline Staff ({transferSelectedIds.length} of {visibleStaff.length} selected)
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setTransferSelectedIds(visibleStaff.map((s) => Number(s.id)))}
+                        className="text-[11px] font-semibold text-[#0F2744] underline"
+                      >
+                        Select All
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setTransferSelectedIds([])}
+                        className="text-[11px] font-semibold text-slate-500 underline"
+                      >
+                        Clear
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="max-h-56 overflow-y-auto divide-y divide-slate-100">
+                    {visibleStaff.length === 0 ? (
+                      <div className="p-6 text-center text-xs text-slate-500">
+                        No downline staff found under this filter.
+                      </div>
+                    ) : (
+                      visibleStaff.map((emp) => {
+                        const checked = transferSelectedIds.includes(Number(emp.id));
+                        return (
+                          <label
+                            key={emp.id}
+                            className={`flex items-center justify-between gap-3 px-3 py-2 text-xs cursor-pointer hover:bg-slate-50 ${
+                              checked ? 'bg-blue-50/50' : ''
+                            }`}
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => toggleSelectId(Number(emp.id))}
+                                className="rounded border-slate-300"
+                              />
+                              <div className="min-w-0">
+                                <div className="font-semibold text-[#0F2744] truncate">
+                                  {emp.fullName}{' '}
+                                  <span className="font-mono font-normal text-slate-500">({emp.employeeCode})</span>
+                                </div>
+                                <div className="text-[11px] text-slate-500">
+                                  Current Senior: {emp.reportsToName ? `${emp.reportsToName} (${emp.reportsToCode})` : 'Unassigned'}
+                                </div>
+                              </div>
+                            </div>
+                            <span
+                              className={`text-[11px] font-semibold shrink-0 ${
+                                emp.isActive ? 'text-[#15803D]' : 'text-[#DC2626]'
+                              }`}
+                            >
+                              {emp.isActive ? 'ON' : 'OFF'}
+                            </span>
+                          </label>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+                  <button
+                    type="button"
+                    onClick={() => setTransferModalOpen(false)}
+                    className="px-4 py-2 text-xs font-semibold rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={savingTransfer || transferSelectedIds.length === 0 || !transferTargetSeniorId}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg bg-[#EA580C] hover:bg-[#C2410C] disabled:opacity-50 text-white"
+                  >
+                    <ArrowRightLeft className="w-3.5 h-3.5" />
+                    {savingTransfer
+                      ? 'Transferring…'
+                      : `Transfer ${transferSelectedIds.length} Member${transferSelectedIds.length === 1 ? '' : 's'}`}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* =================================================================== */}
+      {/* MODAL 3: PERMANENT DELETE EMPLOYEE ID (WITH SAFE DOWNLINE TRANSFER) */}
+      {/* =================================================================== */}
+      {isSuperAdmin && deleteModalUser && (() => {
+        const directDownline = users.filter(
+          (c) => Number(c.reportsToUserId || 0) === Number(deleteModalUser.id)
+        );
+        const replacementSeniors =
+          directDownline.length > 0
+            ? users.filter(
+                (s) => s.isActive && s.role === deleteModalUser.role && s.id !== deleteModalUser.id
+              )
+            : [];
+
+        return (
+          <div
+            className="fixed inset-0 z-50 bg-slate-900/55 flex items-center justify-center p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-user-modal-title"
+          >
+            <div className="bg-white border border-red-200 rounded-xl w-full max-w-md shadow-xl overflow-hidden">
+              <div className="px-5 py-4 border-b border-red-100 bg-red-50/70 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 text-[#DC2626] shrink-0" />
+                  <h3 id="delete-user-modal-title" className="text-sm font-display font-bold text-[#991B1B]">
+                    Delete Employee ID Permanently
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDeleteModalUser(null)}
+                  className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-white/70"
+                  aria-label="Close delete confirmation"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <div className="p-5 space-y-4">
+                <div className="p-3 rounded-lg bg-slate-50 border border-slate-200 text-xs space-y-1">
+                  <div className="font-semibold text-[#0F2744]">
+                    {deleteModalUser.fullName}{' '}
+                    <span className="font-mono text-[#EA580C]">({deleteModalUser.employeeCode})</span>
+                  </div>
+                  <div className="text-slate-500">
+                    Designation: {deleteModalUser.role === 'LEAD_GENERATOR' ? 'Back Office Team' : String(deleteModalUser.role).replace(/_/g, ' ')}
+                    {deleteModalUser.mobile ? ` · ${deleteModalUser.mobile}` : ''}
+                  </div>
+                </div>
+
+                {directDownline.length > 0 && (
+                  <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 space-y-2">
+                    <div className="text-xs font-semibold text-amber-900">
+                      This ID has {directDownline.length} downline employee(s) mapped under it
+                    </div>
+                    <p className="text-[11px] text-amber-800">
+                      Optionally transfer all {directDownline.length} downline employee(s) to another active senior before
+                      deleting this ID:
+                    </p>
+                    <select
+                      value={deleteTransferToId}
+                      onChange={(e) => setDeleteTransferToId(e.target.value)}
+                      className="w-full px-3 py-2 text-xs rounded-lg border border-amber-300 bg-white text-slate-900"
+                    >
+                      <option value="">Unlink downline staff (reassign later)</option>
+                      {replacementSeniors.map((s) => (
+                        <option key={s.id} value={String(s.id)}>
+                          Transfer {directDownline.length} staff → {s.fullName} ({s.employeeCode}) [{s.childCount ?? 0}
+                          {s.quotaMax ? `/${s.quotaMax}` : ''}]
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Deleting this ID permanently removes their login access, saved password, and Google Cloud backup record.
+                  All historical customer leads and uploaded documents remain safely preserved under Admin/Replacement ownership.
+                </p>
+
+                <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100">
+                  <button
+                    type="button"
+                    onClick={() => setDeleteModalUser(null)}
+                    className="px-4 py-2 text-xs font-semibold rounded-lg border border-slate-300 bg-white hover:bg-slate-50 text-slate-700"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={deletingUser}
+                    onClick={() => void handleConfirmDeleteUser()}
+                    className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg bg-[#DC2626] hover:bg-red-700 disabled:opacity-60 text-white"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    {deletingUser ? 'Deleting…' : 'Delete Employee ID'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

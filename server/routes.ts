@@ -6804,14 +6804,47 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       }
     }
 
+    const {
+      transferExistingDownlineToUserId,
+    } = req.body as Record<string, any>;
+
     const nextRole = role !== undefined && VALID_USER_ROLES.includes(role) ? (role as UserRole) : (target.role as UserRole);
-    const nextParentId =
-      reportsToUserId !== undefined ? (reportsToUserId ? Number(reportsToUserId) : null) : target.reports_to_user_id;
+    const roleChanged = nextRole !== (target.role as UserRole);
+
+    if (roleChanged && targetId === admin.id && nextRole !== 'SUPER_ADMIN') {
+      res.status(400).json({ error: 'You cannot change your own active Super Admin designation.' });
+      return;
+    }
+
+    if (roleChanged && target.role === 'SUPER_ADMIN' && nextRole !== 'SUPER_ADMIN') {
+      const otherAdmins = db
+        .prepare(`SELECT COUNT(*) as cnt FROM users WHERE role = 'SUPER_ADMIN' AND is_active = 1 AND id != ?`)
+        .get(targetId) as { cnt: number };
+      if (Number(otherAdmins?.cnt ?? 0) === 0) {
+        res.status(400).json({ error: 'At least one active Super Admin account must remain in the system.' });
+        return;
+      }
+    }
+
+    const isTopLevelNextRole = ['SUPER_ADMIN', 'BRANCH_MANAGER', 'LEAD_GENERATOR'].includes(nextRole);
+    const nextParentId = isTopLevelNextRole
+      ? null
+      : reportsToUserId !== undefined
+      ? reportsToUserId
+        ? Number(reportsToUserId)
+        : null
+      : target.reports_to_user_id;
+
+    if (nextParentId && Number(nextParentId) === targetId) {
+      res.status(400).json({ error: 'An employee cannot report to themselves.' });
+      return;
+    }
+
     const nextActive = typeof isActive === 'boolean' ? isActive : Boolean(target.is_active);
     const needsCapacityValidation =
       nextActive &&
       ['TEAM_LEADER', 'FIELD_OFFICER', 'REFERRAL_PARTNER'].includes(nextRole) &&
-      (reportsToUserId !== undefined || role !== undefined || (typeof isActive === 'boolean' && isActive && !target.is_active));
+      (reportsToUserId !== undefined || roleChanged || (typeof isActive === 'boolean' && isActive && !target.is_active));
 
     let syncedBranchId: number | null | undefined = branchId !== undefined ? (branchId ? Number(branchId) : null) : undefined;
     let syncedTeamId: number | null | undefined = teamId !== undefined ? (teamId ? Number(teamId) : null) : undefined;
@@ -6825,6 +6858,41 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       if (hierCheck.branchId) syncedBranchId = hierCheck.branchId;
       if ((nextRole === 'FIELD_OFFICER' || nextRole === 'REFERRAL_PARTNER') && hierCheck.teamId) {
         syncedTeamId = hierCheck.teamId;
+      }
+    }
+
+    // If designation/role changed and this employee currently has direct downline staff,
+    // validate optional replacement senior transfer before mutating anything.
+    const existingChildren = roleChanged
+      ? (db
+          .prepare(`SELECT id, employee_code, full_name, role, is_active FROM users WHERE reports_to_user_id = ?`)
+          .all(targetId) as { id: number; employee_code: string; full_name: string; role: UserRole; is_active: number }[])
+      : [];
+
+    let replacementSenior: any = null;
+    if (roleChanged && existingChildren.length > 0 && transferExistingDownlineToUserId) {
+      const repId = Number(transferExistingDownlineToUserId);
+      if (repId === targetId) {
+        res.status(400).json({ error: 'Replacement senior cannot be the same employee whose designation is changing.' });
+        return;
+      }
+      replacementSenior = db
+        .prepare(`SELECT id, employee_code, full_name, role, branch_id, team_id, is_active FROM users WHERE id = ?`)
+        .get(repId) as any;
+      if (!replacementSenior || !replacementSenior.is_active || replacementSenior.role !== target.role) {
+        res.status(400).json({
+          error: `Replacement senior must be an active ${String(target.role).replace(/_/g, ' ')}.`,
+        });
+        return;
+      }
+      const activeChildRole = existingChildren[0].role;
+      const activeChildCount = existingChildren.filter((c) => c.is_active).length;
+      if (activeChildCount > 0) {
+        const capCheck = validateParentHierarchyAndCapacity(activeChildRole, repId, activeChildCount);
+        if (capCheck.ok === false) {
+          res.status(400).json({ error: `Cannot transfer downline to ${replacementSenior.full_name}: ${capCheck.error}` });
+          return;
+        }
       }
     }
 
@@ -6869,11 +6937,76 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     if (mobile !== undefined) {
       db.prepare('UPDATE users SET mobile = ? WHERE id = ?').run(String(mobile || '').trim(), targetId);
     }
-    if (role !== undefined && VALID_USER_ROLES.includes(role)) {
-      db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, targetId);
+
+    let transferredChildCount = 0;
+    if (roleChanged) {
+      db.prepare('UPDATE users SET role = ? WHERE id = ?').run(nextRole, targetId);
+      // Auto-assign a unique referral code if promoted/changed to REFERRAL_PARTNER without one
+      if (nextRole === 'REFERRAL_PARTNER' && !target.referral_code && renamedRefCode === undefined) {
+        const baseRef = `DSA-${renamedEmpCode || target.employee_code}`;
+        const conflict = db.prepare(`SELECT id FROM users WHERE UPPER(referral_code) = UPPER(?) AND id != ?`).get(baseRef, targetId);
+        const autoRef = conflict ? `${baseRef}-${targetId}` : baseRef;
+        db.prepare('UPDATE users SET referral_code = ? WHERE id = ?').run(autoRef, targetId);
+      }
+      // Handle existing downline children of the old role
+      if (existingChildren.length > 0) {
+        if (replacementSenior) {
+          db.prepare(
+            `UPDATE users SET reports_to_user_id = ?, branch_id = COALESCE(?, branch_id), team_id = COALESCE(?, team_id) WHERE reports_to_user_id = ?`
+          ).run(
+            replacementSenior.id,
+            replacementSenior.branch_id ?? null,
+            replacementSenior.team_id ?? null,
+            targetId
+          );
+          if (target.role === 'BRANCH_MANAGER') {
+            db.prepare(`UPDATE leads SET assigned_bm_id = ? WHERE assigned_bm_id = ? AND status NOT IN ('Disbursed', 'Closed')`).run(
+              replacementSenior.id,
+              targetId
+            );
+          } else if (target.role === 'TEAM_LEADER') {
+            db.prepare(`UPDATE leads SET assigned_tl_id = ? WHERE assigned_tl_id = ? AND status NOT IN ('Disbursed', 'Closed')`).run(
+              replacementSenior.id,
+              targetId
+            );
+          }
+          transferredChildCount = existingChildren.length;
+        } else {
+          db.prepare(`UPDATE users SET reports_to_user_id = NULL WHERE reports_to_user_id = ?`).run(targetId);
+        }
+      }
+      logAudit(
+        admin,
+        'DESIGNATION_CHANGED',
+        'USER',
+        renamedEmpCode || target.employee_code,
+        `Changed designation of ${target.full_name} (${renamedEmpCode || target.employee_code}) from ${target.role} to ${nextRole}${
+          transferredChildCount > 0 && replacementSenior
+            ? ` and transferred ${transferredChildCount} downline member(s) to ${replacementSenior.full_name} (${replacementSenior.employee_code})`
+            : ''
+        }`
+      );
     }
-    if (reportsToUserId !== undefined) {
+
+    const parentActuallyChanged =
+      (reportsToUserId !== undefined || isTopLevelNextRole) &&
+      Number(nextParentId || 0) !== Number(target.reports_to_user_id || 0);
+
+    if (reportsToUserId !== undefined || isTopLevelNextRole) {
       db.prepare('UPDATE users SET reports_to_user_id = ? WHERE id = ?').run(nextParentId, targetId);
+      if (parentActuallyChanged && nextParentId) {
+        if (nextRole === 'TEAM_LEADER') {
+          db.prepare(`UPDATE leads SET assigned_bm_id = ? WHERE assigned_tl_id = ? AND status NOT IN ('Disbursed', 'Closed')`).run(
+            nextParentId,
+            targetId
+          );
+        } else if (nextRole === 'FIELD_OFFICER') {
+          const newTl = db.prepare(`SELECT reports_to_user_id FROM users WHERE id = ?`).get(nextParentId) as { reports_to_user_id: number | null } | undefined;
+          db.prepare(
+            `UPDATE leads SET assigned_tl_id = ?, assigned_bm_id = COALESCE(?, assigned_bm_id) WHERE assigned_officer_id = ? AND status NOT IN ('Disbursed', 'Closed')`
+          ).run(nextParentId, newTl?.reports_to_user_id ?? null, targetId);
+        }
+      }
     }
     if (syncedBranchId !== undefined) {
       db.prepare('UPDATE users SET branch_id = ? WHERE id = ?').run(syncedBranchId, targetId);
@@ -6919,7 +7052,7 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
     }
 
     syncUsersBackupToDisk();
-    if (typeof isActive !== 'boolean' && !newPassword && !renamedEmpCode && renamedRefCode === undefined) {
+    if (typeof isActive !== 'boolean' && !newPassword && !renamedEmpCode && renamedRefCode === undefined && !roleChanged) {
       logAudit(
         admin,
         'USER_UPDATED',
@@ -6932,6 +7065,8 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       'HIERARCHY_UPDATED',
       renamedEmpCode
         ? `Employee ID renamed to ${renamedEmpCode} (${target.full_name})`
+        : roleChanged
+        ? `Designation changed to ${nextRole.replace(/_/g, ' ')} for ${target.full_name}`
         : `Staff profile/hierarchy updated for ${target.full_name} (${renamedEmpCode || target.employee_code})`,
       admin
     );
@@ -6939,6 +7074,334 @@ ${iconXml}\t\t\t<key>IgnoreManifestScope</key>
       ok: true,
       employeeCode: renamedEmpCode || target.employee_code,
       referralCode: renamedRefCode !== undefined ? renamedRefCode : target.referral_code,
+      role: nextRole,
+      transferredChildCount,
+    });
+  });
+
+  // Bulk or Single Downline Transfer to Another Senior (Super Admin Only)
+  router.post('/admin/users/transfer-downline', requireAuth, requireRoles('SUPER_ADMIN'), (req: AuthedRequest, res) => {
+    const admin = req.user!;
+    const { employeeIds, targetSeniorId } = req.body as {
+      employeeIds?: number[];
+      targetSeniorId?: number;
+    };
+
+    const cleanIds = Array.from(
+      new Set((Array.isArray(employeeIds) ? employeeIds : []).map((n) => Number(n)).filter((n) => Number.isFinite(n) && n > 0))
+    );
+    const nextSeniorId = Number(targetSeniorId || 0);
+
+    if (cleanIds.length === 0 || !nextSeniorId) {
+      res.status(400).json({ error: 'Please select at least one downline employee and a destination senior.' });
+      return;
+    }
+    if (cleanIds.includes(nextSeniorId)) {
+      res.status(400).json({ error: 'Cannot transfer an employee under themselves.' });
+      return;
+    }
+
+    const senior = db
+      .prepare(`SELECT id, employee_code, full_name, role, branch_id, team_id, reports_to_user_id, is_active FROM users WHERE id = ?`)
+      .get(nextSeniorId) as any;
+    if (!senior || !senior.is_active) {
+      res.status(404).json({ error: 'Selected destination senior was not found or is currently OFF (inactive).' });
+      return;
+    }
+
+    const expectedChildRoleMap: Partial<Record<UserRole, { childRole: UserRole; max: number; label: string }>> = {
+      BRANCH_MANAGER: { childRole: 'TEAM_LEADER', max: HIERARCHY_LIMITS.TEAM_LEADERS_PER_BM, label: 'Team Leaders' },
+      TEAM_LEADER: { childRole: 'FIELD_OFFICER', max: HIERARCHY_LIMITS.FIELD_OFFICERS_PER_TL, label: 'Field Officers' },
+      FIELD_OFFICER: { childRole: 'REFERRAL_PARTNER', max: HIERARCHY_LIMITS.REFERRALS_PER_FO, label: 'Referral Partners' },
+    };
+
+    const mappingRule = expectedChildRoleMap[senior.role as UserRole];
+    if (!mappingRule) {
+      res.status(400).json({
+        error: 'Destination senior must be a Branch Manager (for TLs), Team Leader (for FOs), or Field Officer (for Referrals).',
+      });
+      return;
+    }
+
+    const employees = db
+      .prepare(
+        `SELECT id, employee_code, full_name, role, reports_to_user_id, is_active FROM users WHERE id IN (${cleanIds
+          .map(() => '?')
+          .join(',')})`
+      )
+      .all(...cleanIds) as any[];
+
+    if (employees.length === 0) {
+      res.status(404).json({ error: 'No matching employees found to transfer.' });
+      return;
+    }
+
+    const invalidRoleEmp = employees.find((e) => e.role !== mappingRule.childRole);
+    if (invalidRoleEmp) {
+      res.status(400).json({
+        error: `${invalidRoleEmp.full_name} (${invalidRoleEmp.employee_code}) is a ${String(invalidRoleEmp.role).replace(
+          /_/g,
+          ' '
+        )} and cannot be mapped under ${senior.full_name} (${String(senior.role).replace(/_/g, ' ')}).`,
+      });
+      return;
+    }
+
+    // Count how many newly added ACTIVE children will increase target senior's quota
+    const newlyAddedActiveCount = employees.filter(
+      (e) => Boolean(e.is_active) && Number(e.reports_to_user_id || 0) !== nextSeniorId
+    ).length;
+
+    if (newlyAddedActiveCount > 0) {
+      const capCheck = validateParentHierarchyAndCapacity(mappingRule.childRole, nextSeniorId, newlyAddedActiveCount);
+      if (capCheck.ok === false) {
+        res.status(400).json({ error: capCheck.error });
+        return;
+      }
+    }
+
+    const transferTx = db.transaction(() => {
+      const updateUser = db.prepare(`
+        UPDATE users
+        SET reports_to_user_id = ?,
+            branch_id = COALESCE(?, branch_id),
+            team_id = CASE WHEN ? IN ('FIELD_OFFICER', 'REFERRAL_PARTNER') THEN COALESCE(?, team_id) ELSE team_id END
+        WHERE id = ?
+      `);
+
+      for (const emp of employees) {
+        updateUser.run(nextSeniorId, senior.branch_id ?? null, emp.role, senior.team_id ?? null, emp.id);
+
+        if (emp.role === 'TEAM_LEADER') {
+          db.prepare(
+            `UPDATE leads SET assigned_bm_id = ?, branch_id = COALESCE(?, branch_id) WHERE assigned_tl_id = ? AND status NOT IN ('Disbursed', 'Closed')`
+          ).run(nextSeniorId, senior.branch_id ?? null, emp.id);
+        } else if (emp.role === 'FIELD_OFFICER') {
+          db.prepare(
+            `UPDATE leads SET assigned_tl_id = ?, assigned_bm_id = COALESCE(?, assigned_bm_id), branch_id = COALESCE(?, branch_id) WHERE assigned_officer_id = ? AND status NOT IN ('Disbursed', 'Closed')`
+          ).run(nextSeniorId, senior.reports_to_user_id ?? null, senior.branch_id ?? null, emp.id);
+        }
+
+        createAlert({
+          userId: Number(emp.id),
+          category: 'Lead Follow-up Alert',
+          titleEn: 'Reporting Senior Updated',
+          titleHi: 'रिपोर्टिंग सीनियर बदला गया',
+          messageEn: `Admin mapped your ID (${emp.employee_code}) under ${senior.full_name} (${senior.employee_code}).`,
+          messageHi: `एडमिन ने आपकी आईडी (${emp.employee_code}) को ${senior.full_name} (${senior.employee_code}) के अंडर ट्रांसफर किया है।`,
+        });
+      }
+
+      createAlert({
+        userId: nextSeniorId,
+        category: 'Lead Follow-up Alert',
+        titleEn: `${employees.length} Downline Member(s) Transferred`,
+        titleHi: `${employees.length} डाउनलाइन सदस्य ट्रांसफर हुए`,
+        messageEn: `Super Admin transferred ${employees.length} ${mappingRule.label} into your downline.`,
+        messageHi: `सुपर एडमिन ने ${employees.length} ${mappingRule.label} को आपकी डाउनलाइन में ट्रांसफर किया है।`,
+      });
+    });
+
+    transferTx();
+    syncUsersBackupToDisk();
+    logAudit(
+      admin,
+      'DOWNLINE_TRANSFERRED',
+      'USER',
+      senior.employee_code,
+      `Transferred ${employees.length} ${mappingRule.label} (${employees
+        .map((e) => e.employee_code)
+        .slice(0, 8)
+        .join(', ')}) to ${senior.full_name} (${senior.employee_code})`
+    );
+    broadcastLiveSync(
+      'HIERARCHY_UPDATED',
+      `Transferred ${employees.length} ${mappingRule.label} under ${senior.full_name} (${senior.employee_code})`,
+      admin
+    );
+
+    res.json({
+      ok: true,
+      transferredCount: employees.length,
+      targetSenior: {
+        id: senior.id,
+        employeeCode: senior.employee_code,
+        fullName: senior.full_name,
+        role: senior.role,
+      },
+    });
+  });
+
+  // Permanently Delete Any Employee ID (Super Admin Only — FK-Safe with Optional Downline Transfer)
+  router.delete('/admin/users/:id', requireAuth, requireRoles('SUPER_ADMIN'), (req: AuthedRequest, res) => {
+    const admin = req.user!;
+    const targetId = Number(req.params.id);
+    const rawTransferTo = req.body?.transferDownlineToUserId ?? req.query?.transferDownlineToUserId;
+    const transferToId = rawTransferTo ? Number(rawTransferTo) : null;
+
+    if (!Number.isFinite(targetId) || targetId <= 0) {
+      res.status(400).json({ error: 'Invalid employee ID.' });
+      return;
+    }
+
+    if (targetId === admin.id) {
+      res.status(400).json({ error: 'You cannot delete your own currently signed-in Super Admin account.' });
+      return;
+    }
+
+    const target = db.prepare('SELECT * FROM users WHERE id = ?').get(targetId) as any;
+    if (!target) {
+      res.status(404).json({ error: 'Employee ID not found.' });
+      return;
+    }
+
+    if (target.role === 'SUPER_ADMIN') {
+      const otherAdmins = db
+        .prepare(`SELECT COUNT(*) as cnt FROM users WHERE role = 'SUPER_ADMIN' AND is_active = 1 AND id != ?`)
+        .get(targetId) as { cnt: number };
+      if (Number(otherAdmins?.cnt ?? 0) === 0) {
+        res.status(400).json({ error: 'Cannot delete the last remaining active Super Admin account.' });
+        return;
+      }
+    }
+
+    const directChildren = db
+      .prepare(`SELECT id, employee_code, full_name, role, is_active FROM users WHERE reports_to_user_id = ?`)
+      .all(targetId) as { id: number; employee_code: string; full_name: string; role: UserRole; is_active: number }[];
+
+    let replacementSenior: any = null;
+    if (transferToId) {
+      if (transferToId === targetId) {
+        res.status(400).json({ error: 'Replacement senior cannot be the employee being deleted.' });
+        return;
+      }
+      replacementSenior = db
+        .prepare(`SELECT id, employee_code, full_name, role, branch_id, team_id, reports_to_user_id, is_active FROM users WHERE id = ?`)
+        .get(transferToId) as any;
+      if (!replacementSenior || !replacementSenior.is_active || replacementSenior.role !== target.role) {
+        res.status(400).json({
+          error: `Replacement senior must be an active ${String(target.role).replace(/_/g, ' ')}.`,
+        });
+        return;
+      }
+      if (directChildren.length > 0) {
+        const activeChildCount = directChildren.filter((c) => c.is_active).length;
+        if (activeChildCount > 0) {
+          const capCheck = validateParentHierarchyAndCapacity(directChildren[0].role, transferToId, activeChildCount);
+          if (capCheck.ok === false) {
+            res.status(400).json({ error: `Cannot transfer downline to ${replacementSenior.full_name}: ${capCheck.error}` });
+            return;
+          }
+        }
+      }
+    }
+
+    const fallbackOwnerId = replacementSenior ? Number(replacementSenior.id) : admin.id;
+    let transferredDownlineCount = 0;
+
+    const deleteTx = db.transaction(() => {
+      // 1. Transfer or unlink direct downline employees
+      if (directChildren.length > 0) {
+        if (replacementSenior) {
+          db.prepare(
+            `UPDATE users SET reports_to_user_id = ?, branch_id = COALESCE(?, branch_id), team_id = COALESCE(?, team_id) WHERE reports_to_user_id = ?`
+          ).run(
+            replacementSenior.id,
+            replacementSenior.branch_id ?? null,
+            replacementSenior.team_id ?? null,
+            targetId
+          );
+          transferredDownlineCount = directChildren.length;
+        } else {
+          db.prepare(`UPDATE users SET reports_to_user_id = NULL WHERE reports_to_user_id = ?`).run(targetId);
+        }
+      }
+
+      // 2. Clean/reassign all FK references safely so historical leads & documents are never lost
+      db.prepare(`UPDATE teams SET leader_user_id = NULL WHERE leader_user_id = ?`).run(targetId);
+
+      db.prepare(`UPDATE leads SET created_by = ? WHERE created_by = ?`).run(fallbackOwnerId, targetId);
+      db.prepare(`UPDATE leads SET assigned_bm_id = ? WHERE assigned_bm_id = ?`).run(
+        replacementSenior && target.role === 'BRANCH_MANAGER' ? replacementSenior.id : null,
+        targetId
+      );
+      db.prepare(`UPDATE leads SET assigned_tl_id = ? WHERE assigned_tl_id = ?`).run(
+        replacementSenior && target.role === 'TEAM_LEADER' ? replacementSenior.id : null,
+        targetId
+      );
+      db.prepare(`UPDATE leads SET assigned_officer_id = ? WHERE assigned_officer_id = ?`).run(
+        replacementSenior && target.role === 'FIELD_OFFICER' ? replacementSenior.id : null,
+        targetId
+      );
+      db.prepare(`UPDATE leads SET rejected_by = NULL WHERE rejected_by = ?`).run(targetId);
+      db.prepare(`UPDATE leads SET closure_requested_by = NULL WHERE closure_requested_by = ?`).run(targetId);
+      db.prepare(`UPDATE leads SET closure_approved_by = NULL WHERE closure_approved_by = ?`).run(targetId);
+
+      db.prepare(`UPDATE duplicate_requests SET submitted_by = ? WHERE submitted_by = ?`).run(admin.id, targetId);
+      db.prepare(`UPDATE duplicate_requests SET reviewed_by = NULL WHERE reviewed_by = ?`).run(targetId);
+      db.prepare(`UPDATE case_history SET updated_by = ? WHERE updated_by = ?`).run(admin.id, targetId);
+      db.prepare(`UPDATE documents SET uploaded_by = ? WHERE uploaded_by = ?`).run(admin.id, targetId);
+      db.prepare(`UPDATE followup_reminders SET assigned_officer_id = ? WHERE assigned_officer_id = ?`).run(
+        fallbackOwnerId,
+        targetId
+      );
+      db.prepare(`UPDATE followup_reminders SET created_by = ? WHERE created_by = ?`).run(admin.id, targetId);
+      db.prepare(`UPDATE followup_recordings SET recorded_by = ? WHERE recorded_by = ?`).run(admin.id, targetId);
+
+      db.prepare(`DELETE FROM penalties WHERE employee_id = ?`).run(targetId);
+      db.prepare(`UPDATE penalties SET reviewed_by = NULL WHERE reviewed_by = ?`).run(targetId);
+
+      db.prepare(`UPDATE enquiries SET referral_user_id = ? WHERE referral_user_id = ?`).run(fallbackOwnerId, targetId);
+      db.prepare(`UPDATE enquiries SET assigned_officer_id = ? WHERE assigned_officer_id = ?`).run(
+        replacementSenior && target.role === 'FIELD_OFFICER' ? replacementSenior.id : null,
+        targetId
+      );
+
+      db.prepare(`DELETE FROM gps_logs WHERE employee_id = ?`).run(targetId);
+      db.prepare(`DELETE FROM bike_runs WHERE employee_id = ?`).run(targetId);
+      db.prepare(`UPDATE bike_runs SET reviewed_by = NULL WHERE reviewed_by = ?`).run(targetId);
+      db.prepare(`UPDATE settings SET updated_by = NULL WHERE updated_by = ?`).run(targetId);
+      db.prepare(`UPDATE referral_payouts SET referral_user_id = NULL WHERE referral_user_id = ?`).run(targetId);
+      db.prepare(`DELETE FROM staff_rewards WHERE employee_id = ?`).run(targetId);
+      db.prepare(`UPDATE staff_rewards SET awarded_by = NULL WHERE awarded_by = ?`).run(targetId);
+      db.prepare(`UPDATE staff_rewards SET waived_by = NULL WHERE waived_by = ?`).run(targetId);
+      db.prepare(`DELETE FROM attendance_logs WHERE employee_id = ?`).run(targetId);
+      db.prepare(`DELETE FROM leave_requests WHERE employee_id = ?`).run(targetId);
+      db.prepare(`UPDATE leave_requests SET reviewed_by = NULL WHERE reviewed_by = ?`).run(targetId);
+      db.prepare(`DELETE FROM sales_targets WHERE user_id = ?`).run(targetId);
+      db.prepare(`DELETE FROM alerts WHERE user_id = ?`).run(targetId);
+      db.prepare(`DELETE FROM sessions WHERE user_id = ?`).run(targetId);
+      db.prepare(`DELETE FROM otp_challenges WHERE user_id = ?`).run(targetId);
+
+      // 3. Permanently delete the employee row
+      db.prepare(`DELETE FROM users WHERE id = ?`).run(targetId);
+    });
+
+    deleteTx();
+    syncUsersBackupToDisk();
+
+    logAudit(
+      admin,
+      'USER_DELETED',
+      'USER',
+      target.employee_code,
+      `Permanently deleted Employee ID ${target.employee_code} (${target.full_name} · ${target.role})${
+        transferredDownlineCount > 0 && replacementSenior
+          ? ` and transferred ${transferredDownlineCount} downline member(s) to ${replacementSenior.full_name} (${replacementSenior.employee_code})`
+          : ''
+      }`
+    );
+    broadcastLiveSync(
+      'HIERARCHY_UPDATED',
+      `Employee ID ${target.employee_code} (${target.full_name}) deleted by Super Admin`,
+      admin
+    );
+
+    res.json({
+      ok: true,
+      deletedEmployeeCode: target.employee_code,
+      deletedFullName: target.full_name,
+      transferredDownlineCount,
     });
   });
 
